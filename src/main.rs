@@ -1,4 +1,5 @@
 mod app;
+mod diff_pick;
 mod diff_nvim;
 mod editor;
 mod git;

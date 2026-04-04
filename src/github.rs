@@ -460,6 +460,29 @@ pub async fn reply_to_review_comment(
         .await?)
 }
 
+/// Single inline review comment on a PR diff line ([REST](https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request)).
+pub async fn create_pull_review_inline_comment(
+    oct: &Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    commit_sha: &str,
+    path: &str,
+    line: u32,
+    side: &str,
+    body: &str,
+) -> anyhow::Result<PullComment> {
+    let route = format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments");
+    let payload = serde_json::json!({
+        "body": body,
+        "commit_id": commit_sha,
+        "path": path,
+        "line": line,
+        "side": side,
+    });
+    Ok(oct.post(route.as_str(), Some(&payload)).await?)
+}
+
 #[derive(Serialize)]
 struct ReactionBody {
     content: ReactionContent,

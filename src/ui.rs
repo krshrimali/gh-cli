@@ -1,6 +1,8 @@
 //! Layout and styling (Catppuccin-inspired palette on dark backgrounds).
 
-use crate::app::{App, FilterPanelPhase, Overlay, PrListEntry, PrTab, Screen, ThreadItem};
+use crate::app::{
+    App, FilterPanelPhase, InlineReviewPhase, Overlay, PrListEntry, PrTab, Screen, ThreadItem,
+};
 use crate::github;
 use crate::markdown_render;
 use octocrab::models::CommentId;
@@ -21,8 +23,9 @@ const PEACH: Color = Color::Rgb(250, 179, 135);
 const MAUVE: Color = Color::Rgb(203, 166, 247);
 const RED: Color = Color::Rgb(243, 139, 168);
 
-pub fn draw(f: &mut Frame<'_>, app: &App) {
+pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.pr_list_hit_rect.set(None);
+    app.wizard_hit_rect.set(None);
     let full = f.area();
     f.render_widget(
         Block::default().style(Style::default().bg(BG)),
@@ -60,7 +63,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
     draw_overlay(f, app, full);
 }
 
-fn draw_header(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_header(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let who = app
         .me
         .as_deref()
@@ -89,7 +92,7 @@ fn draw_header(f: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_status(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_status(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(SURFACE));
@@ -102,7 +105,7 @@ fn draw_status(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), inner);
 }
 
-fn draw_pr_list(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
@@ -200,7 +203,7 @@ fn draw_pr_list(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(list, inner);
 }
 
-fn draw_pr_detail(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(18), Constraint::Min(0)])
@@ -233,7 +236,7 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(tabs), tab_inner);
 
     let main = h_chunks[1];
-    if let Some(pr) = &app.current_pr {
+    if let Some(pr) = app.current_pr.clone() {
         let title = pr.title.as_deref().unwrap_or("(no title)");
         let head = Line::from(vec![
             Span::styled(
@@ -276,7 +279,7 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &App, area: Rect) {
         );
 
         match app.pr_tab {
-            PrTab::Info => draw_tab_info(f, app, pr, v[1]),
+            PrTab::Info => draw_tab_info(f, app, &pr, v[1]),
             PrTab::Thread => draw_tab_thread(f, app, v[1]),
             PrTab::Commits => draw_tab_commits(f, app, v[1]),
             PrTab::Files => draw_tab_files(f, app, v[1]),
@@ -295,7 +298,7 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn draw_tab_info(f: &mut Frame<'_>, app: &App, pr: &octocrab::models::pulls::PullRequest, area: Rect) {
+fn draw_tab_info(f: &mut Frame<'_>, app: &mut App, pr: &octocrab::models::pulls::PullRequest, area: Rect) {
     let body = pr.body.as_deref().unwrap_or("_No description provided._");
     let p = Paragraph::new(body)
         .wrap(Wrap { trim: true })
@@ -312,7 +315,7 @@ fn draw_tab_info(f: &mut Frame<'_>, app: &App, pr: &octocrab::models::pulls::Pul
     f.render_widget(p, area);
 }
 
-fn draw_tab_thread(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(22), Constraint::Min(6)])
@@ -345,9 +348,7 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .thread_items
         .iter()
-        .enumerate()
-        .map(|(i, it)| {
-            let sel = i == app.thread_cursor;
+        .map(|it| {
             let prefix = match it {
                 ThreadItem::Issue { .. } => ("conv", GREEN),
                 ThreadItem::Review { .. } => ("file", PEACH),
@@ -381,27 +382,37 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &App, area: Rect) {
                     Style::default().fg(MAUVE),
                 ),
                 Span::styled(path_hint, Style::default().fg(SUB)),
-                Span::styled(one_line, Style::default().fg(if sel { TEXT } else { SUB })),
+                Span::styled(one_line, Style::default().fg(SUB)),
             ]);
-            let style = if sel {
-                Style::default().bg(SURFACE)
-            } else {
-                Style::default()
-            };
-            ListItem::new(line).style(style)
+            ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(GREEN))
-            .title(Line::from(Span::styled(
-                " thread  j/k  L reactions  [ ] hunk scroll  E $EDITOR ",
-                Style::default().fg(GREEN),
-            ))),
-    );
-    f.render_widget(list, main[0]);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(GREEN))
+                .title(Line::from(Span::styled(
+                    " thread  j/k  L reactions  [ ] hunk scroll  E $EDITOR ",
+                    Style::default().fg(GREEN),
+                ))),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(SURFACE)
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD),
+        );
+    if app.thread_items.is_empty() {
+        app.thread_list_state.select(None);
+    } else {
+        let i = app
+            .thread_cursor
+            .min(app.thread_items.len().saturating_sub(1));
+        app.thread_list_state.select(Some(i));
+    }
+    f.render_stateful_widget(list, main[0], &mut app.thread_list_state);
 
     // Code context (review diff hunk) + markdown body: side-by-side when wide.
     let bottom = if main[1].width >= 92 {
@@ -520,7 +531,7 @@ fn thread_body_markdown(it: &ThreadItem) -> String {
     }
 }
 
-fn draw_tab_commits(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tab_commits(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .commits
         .iter()
@@ -556,7 +567,7 @@ fn draw_tab_commits(f: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_tab_files(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tab_files(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .files_lines
         .iter()
@@ -585,7 +596,7 @@ fn draw_tab_files(f: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_tab_diff(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tab_diff(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let p = Paragraph::new(app.diff_text.as_str())
         .wrap(Wrap { trim: false })
         .scroll((app.diff_scroll as u16, 0))
@@ -598,37 +609,46 @@ fn draw_tab_diff(f: &mut Frame<'_>, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn draw_tab_reviews(f: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .reviews_lines
         .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let sel = i == app.review_cursor;
+        .map(|s| {
             ListItem::new(Span::styled(
                 s.as_str(),
-                Style::default().fg(if sel { TEXT } else { SUB }),
+                Style::default().fg(SUB),
             ))
-            .style(if sel {
-                Style::default().bg(SURFACE)
-            } else {
-                Style::default()
-            })
         })
         .collect();
-    f.render_widget(
-        List::new(items).block(
+    let list = List::new(items)
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MAUVE))
-                .title(" reviews "),
-        ),
-        area,
-    );
+                .title(Line::from(Span::styled(
+                    " reviews  a inline comment wizard  j/k ",
+                    Style::default().fg(MAUVE),
+                ))),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(SURFACE)
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD),
+        );
+    if app.reviews_lines.is_empty() {
+        app.review_list_state.select(None);
+    } else {
+        let i = app
+            .review_cursor
+            .min(app.reviews_lines.len().saturating_sub(1));
+        app.review_list_state.select(Some(i));
+    }
+    f.render_stateful_widget(list, area, &mut app.review_list_state);
 }
 
-fn draw_overlay(f: &mut Frame<'_>, app: &App, full: Rect) {
-    match &app.overlay {
+fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
+    match &mut app.overlay {
         Overlay::None => {}
         Overlay::Help => {
             let w = (full.width * 4 / 5).max(40);
@@ -681,11 +701,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App, full: Rect) {
             let area = Rect { x, y, width: w, height: h };
             f.render_widget(Clear, area);
             let opts = ["open", "closed", "merged", "draft", "all"];
+            let cur = *cursor;
             let items: Vec<ListItem> = opts
                 .iter()
                 .enumerate()
                 .map(|(i, label)| {
-                    let sel = i == *cursor;
+                    let sel = i == cur;
                     ListItem::new(Span::styled(
                         *label,
                         Style::default().fg(if sel { GREEN } else { TEXT }),
@@ -773,6 +794,110 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App, full: Rect) {
                 area,
             );
         }
+        Overlay::InlineReview {
+            phase,
+            file_cursor,
+            path,
+            diff_lines,
+            line_cursor,
+        } => {
+            let w = (full.width * 4 / 5).max(44);
+            let h = (full.height * 4 / 5).max(14);
+            let x = (full.width.saturating_sub(w)) / 2;
+            let y = (full.height.saturating_sub(h)) / 2;
+            let area = Rect { x, y, width: w, height: h };
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(GREEN))
+                .style(Style::default().bg(SURFACE).fg(TEXT));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            match *phase {
+                InlineReviewPhase::PickFile => {
+                    let title = Line::from(Span::styled(
+                        " inline review — pick file  j/k Enter  mouse  Esc/q ",
+                        Style::default().fg(GREEN).bold(),
+                    ));
+                    let list_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT))
+                        .title(title);
+                    let list_inner = list_block.inner(inner);
+                    app.wizard_hit_rect.set(Some(list_inner));
+                    let items: Vec<ListItem> = app
+                        .file_paths
+                        .iter()
+                        .map(|p| {
+                            ListItem::new(Span::styled(
+                                p.as_str(),
+                                Style::default().fg(SUB),
+                            ))
+                        })
+                        .collect();
+                    let list = List::new(items)
+                        .block(list_block)
+                        .highlight_style(
+                            Style::default()
+                                .bg(BG)
+                                .fg(TEXT)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                    if app.file_paths.is_empty() {
+                        app.inline_review_file_state.select(None);
+                    } else {
+                        let i = (*file_cursor).min(app.file_paths.len().saturating_sub(1));
+                        app.inline_review_file_state.select(Some(i));
+                    }
+                    f.render_stateful_widget(list, inner, &mut app.inline_review_file_state);
+                }
+                InlineReviewPhase::PickLine => {
+                    let title = Line::from(vec![
+                        Span::styled(" line on ", Style::default().fg(GREEN).bold()),
+                        Span::styled(
+                            path.as_str(),
+                            Style::default().fg(PEACH).bold(),
+                        ),
+                        Span::styled(
+                            "  j/k n/p  Enter $EDITOR  Esc file  q quit ",
+                            Style::default().fg(SUB),
+                        ),
+                    ]);
+                    let list_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(PEACH))
+                        .title(title);
+                    let list_inner = list_block.inner(inner);
+                    app.wizard_hit_rect.set(Some(list_inner));
+                    let items: Vec<ListItem> = diff_lines
+                        .iter()
+                        .map(|ln| {
+                            let fg = if ln.anchor.is_some() {
+                                TEXT
+                            } else {
+                                SUB
+                            };
+                            ListItem::new(Span::styled(ln.text.as_str(), Style::default().fg(fg)))
+                        })
+                        .collect();
+                    let list = List::new(items)
+                        .block(list_block)
+                        .highlight_style(
+                            Style::default()
+                                .bg(BG)
+                                .fg(GREEN)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                    if diff_lines.is_empty() {
+                        app.inline_review_line_state.select(None);
+                    } else {
+                        let i = (*line_cursor).min(diff_lines.len().saturating_sub(1));
+                        app.inline_review_line_state.select(Some(i));
+                    }
+                    f.render_stateful_widget(list, inner, &mut app.inline_review_line_state);
+                }
+            }
+        }
         Overlay::CreatePrWizard {
             phase,
             title,
@@ -830,13 +955,18 @@ PR DETAIL (tabs 1-6)\n\
   Ctrl+d u      scroll the focused pane (Info, Thread body, Diff, …)\n\
 \n\
 THREAD (tab 2) — review with code context\n\
-  j k           pick comment (no API while moving — fast)\n\
+  j k           pick comment (list scrolls with selection)\n\
   Center area   left/top = diff at comment, right/bottom = markdown + reactions\n\
   [  ]          scroll the code / diff-hunk pane\n\
   c R e d       new comment / reply / edit / delete\n\
   + L           reaction picker / load counts (cached after L)\n\
   I             Kitty: kitten icat for first image URL in body\n\
   g g  G        scroll comment body top / bottom\n\
+\n\
+REVIEWS (tab 6)\n\
+  j k           scroll submitted reviews list\n\
+  a             start inline review: pick file → diff line → $EDITOR → POST to GitHub\n\
+                Mouse selects rows; n/p jump lines that accept a comment; ```suggestion blocks apply on web\n\
 \n\
 FILTERS  (:command from any screen, refreshes list)\n\
   :filter clear | show    :state open|closed|merged|draft|all\n\
@@ -846,5 +976,4 @@ FILTERS  (:command from any screen, refreshes list)\n\
 STARTUP\n\
   --status STATE              GH_PR_CLI_STATUS  GH_PR_CLI_TITLE  …  (see :filter show)\n\
 \n\
-Not built yet: start-review with line-picked suggestions (use github.com or gh).\n\
 ";

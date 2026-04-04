@@ -1,4 +1,5 @@
 use crate::diff_nvim;
+use crate::diff_pick;
 use crate::editor;
 use crate::git;
 use crate::markdown_render;
@@ -8,6 +9,7 @@ use std::collections::HashMap;
 use anyhow::Context;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::widgets::ListState;
 use std::cell::Cell;
 use octocrab::models::issues::Issue;
 use octocrab::models::pulls::PullRequest;
@@ -286,6 +288,12 @@ pub enum FilterPanelPhase {
     StatusPick { cursor: usize },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InlineReviewPhase {
+    PickFile,
+    PickLine,
+}
+
 pub(crate) fn pr_status_menu_cursor(st: github::PrStatusFilter) -> usize {
     match st {
         github::PrStatusFilter::Open => 0,
@@ -311,6 +319,14 @@ pub enum Overlay {
     },
     /// PR filters + status (`f`; `s` opens status, `A` jumps to status).
     FilterSummary(FilterPanelPhase),
+    /// Reviews tab: pick file → diff line → `$EDITOR` → POST review comment.
+    InlineReview {
+        phase: InlineReviewPhase,
+        file_cursor: usize,
+        path: String,
+        diff_lines: Vec<diff_pick::DiffDisplayLine>,
+        line_cursor: usize,
+    },
 }
 
 pub enum EditorIntent {
@@ -322,6 +338,13 @@ pub enum EditorIntent {
         title: String,
         head: String,
         base: String,
+    },
+    InlineReviewComment {
+        pr: u64,
+        commit_sha: String,
+        path: String,
+        line: u32,
+        side: String,
     },
 }
 
@@ -383,6 +406,8 @@ pub struct App {
     pub commit_cursor: usize,
     pub commit_scroll: usize,
     pub files_lines: Vec<String>,
+    /// Parallel to `files_lines`: raw paths from the API (for inline review + matching `+++ b/`).
+    pub file_paths: Vec<String>,
     pub file_cursor: usize,
     pub file_scroll: usize,
     pub diff_text: String,
@@ -390,6 +415,13 @@ pub struct App {
     pub reviews_lines: Vec<String>,
     pub review_cursor: usize,
     pub review_scroll: usize,
+    /// Stateful list scroll for Thread and Reviews panes.
+    pub thread_list_state: ListState,
+    pub review_list_state: ListState,
+    pub inline_review_file_state: ListState,
+    pub inline_review_line_state: ListState,
+    /// Inner rect of the inline-review list (mouse row → index).
+    pub wizard_hit_rect: Cell<Option<Rect>>,
     pub overlay: Overlay,
     pub command_buf: String,
     pub vim_g_pending: bool,
@@ -440,6 +472,7 @@ impl App {
             commit_cursor: 0,
             commit_scroll: 0,
             files_lines: Vec::new(),
+            file_paths: Vec::new(),
             file_cursor: 0,
             file_scroll: 0,
             diff_text: String::new(),
@@ -447,6 +480,11 @@ impl App {
             reviews_lines: Vec::new(),
             review_cursor: 0,
             review_scroll: 0,
+            thread_list_state: ListState::default(),
+            review_list_state: ListState::default(),
+            inline_review_file_state: ListState::default(),
+            inline_review_line_state: ListState::default(),
+            wizard_hit_rect: Cell::new(None),
             overlay: Overlay::None,
             command_buf: String::new(),
             vim_g_pending: false,
@@ -795,11 +833,14 @@ impl App {
         self.commits.clear();
         self.commit_cursor = 0;
         self.files_lines.clear();
+        self.file_paths.clear();
         self.file_cursor = 0;
         self.diff_text.clear();
         self.diff_scroll = 0;
         self.reviews_lines.clear();
         self.review_cursor = 0;
+        self.thread_list_state = ListState::default();
+        self.review_list_state = ListState::default();
     }
 
     fn load_thread(&mut self, rt: &Runtime) -> anyhow::Result<()> {
@@ -927,6 +968,7 @@ impl App {
         self.loading = false;
         match r {
             Ok(entries) => {
+                self.file_paths = entries.iter().map(|e| e.filename.clone()).collect();
                 self.files_lines = entries
                     .into_iter()
                     .map(|e| {
@@ -1134,6 +1176,34 @@ impl App {
                     Err(e) => self.set_status(format!("create PR: {e:#}")),
                 }
             }
+            EditorIntent::InlineReviewComment {
+                pr,
+                commit_sha,
+                path,
+                line,
+                side,
+            } => {
+                let r = rt.block_on(github::create_pull_review_inline_comment(
+                    &self.octo,
+                    &self.owner,
+                    &self.repo,
+                    pr,
+                    &commit_sha,
+                    &path,
+                    line,
+                    &side,
+                    &body,
+                ));
+                match r {
+                    Ok(_) => {
+                        self.set_status("posted inline review comment");
+                        self.overlay = Overlay::None;
+                        let _ = self.load_thread(rt);
+                        let _ = self.load_reviews(rt);
+                    }
+                    Err(e) => self.set_status(format!("inline comment: {e:#}")),
+                }
+            }
         }
         Ok(())
     }
@@ -1256,6 +1326,139 @@ impl App {
                 }
                 Ok(AppEffect::None)
             }
+            Overlay::InlineReview {
+                phase,
+                file_cursor,
+                path,
+                diff_lines,
+                line_cursor,
+            } => match *phase {
+                InlineReviewPhase::PickFile => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            self.overlay = Overlay::None;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !self.file_paths.is_empty() {
+                                *file_cursor =
+                                    (*file_cursor + 1).min(self.file_paths.len() - 1);
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            *file_cursor = file_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Enter => {
+                            if self.file_paths.is_empty() {
+                                self.set_status("no files on this PR");
+                            } else if let Some(p) = self.file_paths.get(*file_cursor).cloned() {
+                                match diff_pick::extract_file_patch(&self.diff_text, &p) {
+                                    None => self.set_status(format!("no diff chunk for `{p}`")),
+                                    Some(chunk) => {
+                                        if chunk.contains("Binary files ")
+                                            && chunk.contains(" differ")
+                                        {
+                                            self.set_status("binary file — pick another");
+                                        } else {
+                                            let lines = diff_pick::parse_patch_lines(chunk);
+                                            if diff_pick::first_anchor_index(&lines).is_none() {
+                                                self.set_status(
+                                                    "no commentable lines in this diff chunk",
+                                                );
+                                            } else {
+                                                *phase = InlineReviewPhase::PickLine;
+                                                *path = p;
+                                                *diff_lines = lines;
+                                                *line_cursor = diff_pick::first_anchor_index(
+                                                    diff_lines,
+                                                )
+                                                .unwrap_or(0);
+                                                self.inline_review_line_state =
+                                                    ListState::default();
+                                                self.set_status(
+                                                    "line → Enter $EDITOR · n/p anchors · Esc file list · q quit",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(AppEffect::None)
+                }
+                InlineReviewPhase::PickLine => match key.code {
+                    KeyCode::Esc => {
+                        *phase = InlineReviewPhase::PickFile;
+                        diff_lines.clear();
+                        path.clear();
+                        self.inline_review_line_state = ListState::default();
+                        self.set_status("pick a file (Enter)");
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('q') => {
+                        self.overlay = Overlay::None;
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !diff_lines.is_empty() {
+                            *line_cursor = (*line_cursor + 1).min(diff_lines.len() - 1);
+                        }
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *line_cursor = line_cursor.saturating_sub(1);
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('n') => {
+                        if !diff_lines.is_empty() {
+                            *line_cursor =
+                                diff_pick::step_anchor(*line_cursor, diff_lines, true);
+                        }
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('p') => {
+                        if !diff_lines.is_empty() {
+                            *line_cursor =
+                                diff_pick::step_anchor(*line_cursor, diff_lines, false);
+                        }
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Enter => {
+                        let Some(n) = self.pr_number else {
+                            return Ok(AppEffect::None);
+                        };
+                        let Some(pr_obj) = self.current_pr.as_ref() else {
+                            return Ok(AppEffect::None);
+                        };
+                        if let Some(dl) = diff_lines.get(*line_cursor) {
+                            if let Some((line, side)) = dl.anchor {
+                                let initial = format!(
+                                    "## `{path}` line {line} ({side})\n\n\
+Comment (markdown). Optional suggestion block:\n\n\
+```suggestion\n\n```\n",
+                                    path = path.as_str(),
+                                    line = line,
+                                    side = side,
+                                );
+                                return Ok(AppEffect::OpenEditor {
+                                    initial,
+                                    intent: EditorIntent::InlineReviewComment {
+                                        pr: n,
+                                        commit_sha: pr_obj.head.sha.clone(),
+                                        path: path.clone(),
+                                        line,
+                                        side: side.to_string(),
+                                    },
+                                });
+                            }
+                        }
+                        self.set_status("select a numbered diff row (n / p jump commentable lines)");
+                        Ok(AppEffect::None)
+                    }
+                    _ => Ok(AppEffect::None),
+                },
+            },
             Overlay::CreatePrWizard {
                 phase,
                 title,
@@ -1707,6 +1910,11 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('a') => {
+                if self.pr_tab == PrTab::Reviews {
+                    let _ = self.start_inline_review_wizard(rt)?;
+                }
+            }
             KeyCode::Char('R') => {
                 if self.pr_tab == PrTab::Thread {
                     if let Some(ThreadItem::Review { id, .. }) = self.selected_thread_item() {
@@ -1857,6 +2065,69 @@ impl App {
         Ok(AppEffect::None)
     }
 
+    fn start_inline_review_wizard(&mut self, rt: &Runtime) -> anyhow::Result<()> {
+        if self.pr_number.is_none() {
+            return Ok(());
+        }
+        if self.file_paths.is_empty() {
+            self.load_files(rt)?;
+        }
+        if self.diff_text.is_empty() {
+            self.load_diff(rt)?;
+        }
+        if self.file_paths.is_empty() {
+            self.set_status("no changed files — cannot comment on diff");
+            return Ok(());
+        }
+        self.inline_review_file_state = ListState::default();
+        self.inline_review_line_state = ListState::default();
+        self.overlay = Overlay::InlineReview {
+            phase: InlineReviewPhase::PickFile,
+            file_cursor: 0,
+            path: String::new(),
+            diff_lines: Vec::new(),
+            line_cursor: 0,
+        };
+        self.set_status("inline review wizard — pick file (Enter) · mouse · Esc/q quit");
+        Ok(())
+    }
+
+    fn handle_inline_review_mouse(&mut self, m: MouseEvent) {
+        let Some(r) = self.wizard_hit_rect.get() else {
+            return;
+        };
+        if m.column < r.x
+            || m.column >= r.x.saturating_add(r.width)
+            || m.row < r.y
+            || m.row >= r.y.saturating_add(r.height)
+        {
+            return;
+        }
+        let dy = (m.row - r.y) as usize;
+        match &mut self.overlay {
+            Overlay::InlineReview {
+                phase: InlineReviewPhase::PickFile,
+                file_cursor,
+                ..
+            } => {
+                if dy < self.file_paths.len() {
+                    *file_cursor = dy;
+                }
+            }
+            Overlay::InlineReview {
+                phase: InlineReviewPhase::PickLine,
+                line_cursor,
+                diff_lines,
+                ..
+            } => {
+                if dy < diff_lines.len() {
+                    *line_cursor = dy;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn load_reactions_line(&mut self, rt: &Runtime) -> anyhow::Result<()> {
         let Some(it) = self.selected_thread_item() else {
             return Ok(());
@@ -2002,6 +2273,10 @@ impl App {
         match &self.overlay {
             Overlay::FilterSummary(_) => {
                 self.overlay = Overlay::None;
+                return Ok(());
+            }
+            Overlay::InlineReview { .. } => {
+                self.handle_inline_review_mouse(m);
                 return Ok(());
             }
             Overlay::None => {}
