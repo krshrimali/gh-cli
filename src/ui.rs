@@ -1,8 +1,10 @@
 //! Layout and styling (Catppuccin-inspired palette on dark backgrounds).
 
 use crate::app::{
-    App, FilterPanelPhase, InlineReviewPhase, Overlay, PrListEntry, PrTab, Screen, ThreadItem,
+    App, FilterPanelPhase, InlineCommentDraft, Overlay, PrListEntry, PrTab, ReviewsComposePane,
+    ReviewsComposerSubphase, Screen, ThreadItem,
 };
+use crate::diff_pick::{DiffDisplayLine, DiffLineKind};
 use crate::github;
 use crate::markdown_render;
 use octocrab::models::CommentId;
@@ -22,10 +24,15 @@ const GREEN: Color = Color::Rgb(166, 227, 161);
 const PEACH: Color = Color::Rgb(250, 179, 135);
 const MAUVE: Color = Color::Rgb(203, 166, 247);
 const RED: Color = Color::Rgb(243, 139, 168);
+/// GitHub-like diff row tint (dark Catppuccin).
+const DIFF_DEL_BG: Color = Color::Rgb(52, 36, 42);
+const DIFF_ADD_BG: Color = Color::Rgb(36, 48, 42);
 
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.pr_list_hit_rect.set(None);
-    app.wizard_hit_rect.set(None);
+    app.compose_hit_files.set(None);
+    app.compose_hit_diff.set(None);
+    app.compose_hit_actions.set(None);
     let full = f.area();
     f.render_widget(
         Block::default().style(Style::default().bg(BG)),
@@ -610,6 +617,14 @@ fn draw_tab_diff(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if app.reviews_composer.is_some() {
+        draw_reviews_composer(f, app, area);
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(2)])
+        .split(area);
     let items: Vec<ListItem> = app
         .reviews_lines
         .iter()
@@ -626,7 +641,7 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MAUVE))
                 .title(Line::from(Span::styled(
-                    " reviews  a pending-review wizard  j/k ",
+                    " submitted reviews  j/k  ·  a split-pane composer ",
                     Style::default().fg(MAUVE),
                 ))),
         )
@@ -644,7 +659,532 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             .min(app.reviews_lines.len().saturating_sub(1));
         app.review_list_state.select(Some(i));
     }
-    f.render_stateful_widget(list, area, &mut app.review_list_state);
+    f.render_stateful_widget(list, chunks[0], &mut app.review_list_state);
+    let hint = Paragraph::new(Line::from(vec![
+        Span::styled(" a ", Style::default().fg(GREEN).bold()),
+        Span::styled(
+            "opens a 3-pane TUI here (Files | Diff | Finish) — same tab, no popup.  ",
+            Style::default().fg(SUB),
+        ),
+        Span::styled("Esc", Style::default().fg(ACCENT)),
+        Span::styled(" closes composer.", Style::default().fg(SUB)),
+    ]))
+    .style(Style::default().bg(BG));
+    f.render_widget(hint, chunks[1]);
+}
+
+fn split_unicode_str_at(s: &str, char_idx: usize) -> (String, String) {
+    if s.is_empty() {
+        return (String::new(), String::new());
+    }
+    let mut count = 0usize;
+    for (byte_i, _) in s.char_indices() {
+        if count == char_idx {
+            return (s[..byte_i].to_string(), s[byte_i..].to_string());
+        }
+        count += 1;
+    }
+    (s.to_string(), String::new())
+}
+
+fn draft_cursor_row_col(chars: &[char], cursor: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for (i, c) in chars.iter().enumerate() {
+        if i >= cursor {
+            break;
+        }
+        if *c == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
+fn char_lines_for_display(chars: &[char]) -> Vec<String> {
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for c in chars {
+        if *c == '\n' {
+            lines.push(cur);
+            cur = String::new();
+        } else {
+            cur.push(*c);
+        }
+    }
+    lines.push(cur);
+    lines
+}
+
+/// GitHub-style gutter: old │ new │ marker + blue “+” when the row is selected and commentable.
+fn review_diff_list_item(dl: &DiffDisplayLine, body_budget: usize, selected: bool) -> ListItem<'static> {
+    match dl.kind {
+        DiffLineKind::HunkHeader => {
+            let t = PrListEntry::ellipsize(dl.body.as_str(), body_budget.max(8));
+            ListItem::new(Line::from(Span::styled(
+                t,
+                Style::default().fg(MAUVE).italic(),
+            )))
+        }
+        DiffLineKind::OutsideHunk => {
+            let t = PrListEntry::ellipsize(dl.body.as_str(), body_budget.max(8));
+            ListItem::new(Line::from(Span::styled(t, Style::default().fg(SUB))))
+        }
+        _ => {
+            let old_s = dl
+                .old_num
+                .map(|n| format!("{n:>4}"))
+                .unwrap_or_else(|| "    ".to_string());
+            let new_s = dl
+                .new_num
+                .map(|n| format!("{n:>4}"))
+                .unwrap_or_else(|| "    ".to_string());
+            let marker = dl.marker_char();
+            let mk_fg = match dl.kind {
+                DiffLineKind::Removed => RED,
+                DiffLineKind::Added => GREEN,
+                _ => SUB,
+            };
+            let (body_fg, body_bg) = match dl.kind {
+                DiffLineKind::Removed => (Color::Rgb(242, 200, 205), DIFF_DEL_BG),
+                DiffLineKind::Added => (Color::Rgb(190, 230, 200), DIFF_ADD_BG),
+                _ => (TEXT, BG),
+            };
+            let body = PrListEntry::ellipsize(dl.body.as_str(), body_budget.max(8));
+            let pin = if dl.anchor.is_some() {
+                if selected {
+                    Span::styled(
+                        "+",
+                        Style::default()
+                            .fg(BG)
+                            .bg(ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::styled("·", Style::default().fg(ACCENT))
+                }
+            } else {
+                Span::raw(" ")
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(old_s, Style::default().fg(SUB)),
+                Span::styled("│", Style::default().fg(SURFACE)),
+                Span::styled(new_s, Style::default().fg(SUB)),
+                Span::styled("│", Style::default().fg(SURFACE)),
+                Span::styled(
+                    format!("{marker} "),
+                    Style::default().fg(mk_fg),
+                ),
+                pin,
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    body,
+                    Style::default().fg(body_fg).bg(body_bg),
+                ),
+            ]))
+        }
+    }
+}
+
+fn draw_inline_comment_draft(f: &mut Frame<'_>, area: Rect, draft: &InlineCommentDraft) {
+    let path_short = PrListEntry::ellipsize(draft.path.as_str(), 24);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Line::from(vec![
+            Span::styled(" Write ", Style::default().fg(ACCENT).bold()),
+            Span::styled(
+                format!("{path_short}  L{} {}  ", draft.line, draft.side),
+                Style::default().fg(SUB),
+            ),
+            Span::styled("Ctrl+Enter", Style::default().fg(GREEN)),
+            Span::styled(" · ", Style::default().fg(SUB)),
+            Span::styled("Esc", Style::default().fg(PEACH)),
+            Span::styled(" · ", Style::default().fg(SUB)),
+            Span::styled("Ctrl+e", Style::default().fg(MAUVE)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if draft.chars.is_empty() {
+        let line = Line::from(vec![
+            Span::styled(
+                "Leave a comment (Markdown). Use ```suggestion``` for proposed edits (same as github.com). ",
+                Style::default().fg(SUB).italic(),
+            ),
+            Span::styled("▍", Style::default().fg(ACCENT).bold()),
+        ]);
+        f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    let (cur_row, cur_col) = draft_cursor_row_col(&draft.chars, draft.cursor);
+    let lines = char_lines_for_display(&draft.chars);
+    let max_vis = inner.height.saturating_sub(1).max(1) as usize;
+    let start = lines.len().saturating_sub(max_vis);
+    let w = inner.width.saturating_sub(2) as usize;
+
+    let mut text_lines: Vec<Line> = Vec::new();
+    for (vis_i, li) in lines[start..].iter().enumerate() {
+        let ri = start + vis_i;
+        if ri == cur_row {
+            let (a, b) = split_unicode_str_at(li, cur_col);
+            text_lines.push(Line::from(vec![
+                Span::styled(a, Style::default().fg(TEXT)),
+                Span::styled("▍", Style::default().fg(ACCENT).bold()),
+                Span::styled(b, Style::default().fg(TEXT)),
+            ]));
+        } else {
+            let ell = PrListEntry::ellipsize(li.as_str(), w.max(8));
+            text_lines.push(Line::from(Span::styled(
+                ell,
+                Style::default().fg(TEXT),
+            )));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(text_lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Full-tab pending-review UI: three panes + tab strip (not a modal).
+fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let mut tmp = app.reviews_composer.take();
+    let Some(comp) = tmp.as_mut() else {
+        app.reviews_composer = tmp;
+        return;
+    };
+
+    let strip_h = 2u16;
+    let foot_h = 1u16;
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(GREEN))
+        .title(Line::from(vec![
+            Span::styled(" review composer ", Style::default().fg(GREEN).bold()),
+            Span::styled(
+                format!("pending #{}  ", comp.pending_review_id),
+                Style::default().fg(MAUVE),
+            ),
+            Span::styled(
+                format!("{}  ", &comp.commit_sha[..comp.commit_sha.len().min(7)]),
+                Style::default().fg(SUB),
+            ),
+        ]));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(strip_h),
+            Constraint::Min(4),
+            Constraint::Length(foot_h),
+        ])
+        .split(inner);
+
+    if comp.subphase == ReviewsComposerSubphase::ConfirmDiscard {
+        let tab_strip = pane_strip_line(comp.focus);
+        f.render_widget(Paragraph::new(tab_strip), v[0]);
+        let txt = Text::from(vec![
+            Line::from(""),
+            Line::from(
+                Span::styled(
+                    "Discard pending review on GitHub?",
+                    Style::default().fg(RED).bold(),
+                ),
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Draft inline comments in this review will be removed.",
+                Style::default().fg(SUB),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "y  yes     n / Esc  cancel",
+                Style::default().fg(TEXT),
+            )),
+        ]);
+        f.render_widget(
+            Paragraph::new(txt).alignment(Alignment::Center),
+            v[1],
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " confirm discard ",
+                Style::default().fg(RED),
+            )),
+            v[2],
+        );
+        app.reviews_composer = tmp;
+        return;
+    }
+
+    f.render_widget(Paragraph::new(pane_strip_line(comp.focus)), v[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(26),
+            Constraint::Percentage(49),
+            Constraint::Percentage(25),
+        ])
+        .split(v[1]);
+
+    let b_files = pane_border(comp.focus == ReviewsComposePane::Files, ACCENT);
+    let files_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(b_files)
+        .title(Line::from(Span::styled(
+            " ① files ",
+            Style::default().fg(if comp.focus == ReviewsComposePane::Files {
+                GREEN
+            } else {
+                SUB
+            }),
+        )));
+    let fi = files_block.inner(body[0]);
+    app.compose_hit_files.set(Some(fi));
+    let file_items: Vec<ListItem> = app
+        .file_paths
+        .iter()
+        .map(|p| {
+            ListItem::new(Span::styled(
+                p.as_str(),
+                Style::default().fg(SUB),
+            ))
+        })
+        .collect();
+    let flist = List::new(file_items)
+        .block(files_block)
+        .highlight_style(
+            Style::default()
+                .bg(SURFACE)
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD),
+        );
+    if app.file_paths.is_empty() {
+        app.inline_review_file_state.select(None);
+    } else {
+        let i = comp
+            .file_cursor
+            .min(app.file_paths.len().saturating_sub(1));
+        app.inline_review_file_state.select(Some(i));
+    }
+    f.render_stateful_widget(flist, body[0], &mut app.inline_review_file_state);
+
+    let b_diff = pane_border(comp.focus == ReviewsComposePane::Diff, PEACH);
+    let mid_col = body[1];
+    let split_mid = if comp.comment_draft.is_some() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Min(5)])
+            .split(mid_col)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(100), Constraint::Length(0)])
+            .split(mid_col)
+    };
+    let code_area = split_mid[0];
+    let draft_area = if comp.comment_draft.is_some() {
+        Some(split_mid[1])
+    } else {
+        None
+    };
+
+    let diff_title = if comp.path.is_empty() {
+        " ② files changed (pick in ①) ".to_string()
+    } else if comp.comment_draft.is_some() {
+        format!(" ② {} — pick line, + = comment ", comp.path)
+    } else {
+        format!(" ② {} ", comp.path)
+    };
+    let diff_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(b_diff)
+        .title(Line::from(Span::styled(
+            diff_title,
+            Style::default().fg(if comp.focus == ReviewsComposePane::Diff {
+                PEACH
+            } else {
+                SUB
+            }),
+        )));
+    let di = diff_block.inner(code_area);
+    app.compose_hit_diff.set(Some(di));
+    let body_budget = di.width.saturating_sub(2).saturating_sub(18) as usize;
+    let diff_items: Vec<ListItem> = comp
+        .diff_lines
+        .iter()
+        .enumerate()
+        .map(|(idx, ln)| {
+            review_diff_list_item(
+                ln,
+                body_budget.max(12),
+                idx == comp.line_cursor,
+            )
+        })
+        .collect();
+    let hl = if comp.comment_draft.is_some() {
+        Style::default().bg(SURFACE).fg(SUB)
+    } else {
+        Style::default()
+            .bg(SURFACE)
+            .fg(GREEN)
+            .add_modifier(Modifier::BOLD)
+    };
+    let dlist = List::new(diff_items).block(diff_block).highlight_style(hl);
+    if comp.diff_lines.is_empty() {
+        app.inline_review_line_state.select(None);
+    } else {
+        let i = comp
+            .line_cursor
+            .min(comp.diff_lines.len().saturating_sub(1));
+        app.inline_review_line_state.select(Some(i));
+    }
+    f.render_stateful_widget(dlist, code_area, &mut app.inline_review_line_state);
+
+    if let (Some(area), Some(draft)) = (draft_area, comp.comment_draft.as_ref()) {
+        draw_inline_comment_draft(f, area, draft);
+    }
+
+    let act_body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(body[2]);
+
+    let b_act = pane_border(comp.focus == ReviewsComposePane::Actions, MAUVE);
+    let sess_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SUB))
+        .title(Line::from(Span::styled(
+            format!(" session ({}) ", comp.session_comments.len()),
+            Style::default().fg(SUB),
+        )));
+    let si = sess_block.inner(act_body[0]);
+    f.render_widget(sess_block, act_body[0]);
+    let sess_txt = if comp.session_comments.is_empty() {
+        Text::from(Line::from(Span::styled(
+            "No comments in this session yet — in ② press Enter on a + line to write.",
+            Style::default().fg(SUB).italic(),
+        )))
+    } else {
+        Text::from(
+            comp.session_comments
+                .iter()
+                .map(|s| {
+                    Line::from(Span::styled(
+                        PrListEntry::ellipsize(s, si.width.saturating_sub(2) as usize),
+                        Style::default().fg(TEXT),
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    f.render_widget(
+        Paragraph::new(sess_txt).wrap(Wrap { trim: true }),
+        si,
+    );
+
+    let finish_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(b_act)
+        .title(Line::from(Span::styled(
+            " ③ finish ",
+            Style::default().fg(if comp.focus == ReviewsComposePane::Actions {
+                MAUVE
+            } else {
+                SUB
+            }),
+        )));
+    let fai = finish_block.inner(act_body[1]);
+    app.compose_hit_actions.set(Some(fai));
+    let labels = [
+        " Approve (instant)",
+        " Request changes ($EDITOR)",
+        " Comment ($EDITOR)",
+        " Discard pending…",
+    ];
+    let items: Vec<ListItem> = labels
+        .iter()
+        .map(|l| ListItem::new(Span::styled(*l, Style::default().fg(TEXT))))
+        .collect();
+    let alist = List::new(items)
+        .block(finish_block)
+        .highlight_style(
+            Style::default()
+                .bg(SURFACE)
+                .fg(MAUVE)
+                .add_modifier(Modifier::BOLD),
+        );
+    let si_sel = comp.submit_cursor.min(3);
+    app.inline_review_submit_state.select(Some(si_sel));
+    f.render_stateful_widget(alist, act_body[1], &mut app.inline_review_submit_state);
+
+    let footer = match comp.focus {
+        ReviewsComposePane::Files => {
+            " j/k move · Enter load diff into ② · Tab next pane · mouse click pane "
+        }
+        ReviewsComposePane::Diff => {
+            if comp.comment_draft.is_some() {
+                " comment box focused · Ctrl+Enter post · Esc cancel · Ctrl+e $EDITOR "
+            } else {
+                " j/k · n/p commentable · Enter open write box (GitHub-style) · Ctrl+e $EDITOR · Tab "
+            }
+        }
+        ReviewsComposePane::Actions => {
+            " j/k · Enter run · Tab next · Esc leave composer (draft stays on GitHub) "
+        }
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(footer, Style::default().fg(SUB))),
+        v[2],
+    );
+
+    app.reviews_composer = tmp;
+}
+
+fn pane_border(focused: bool, accent: Color) -> Style {
+    if focused {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(SURFACE)
+    }
+}
+
+fn pane_strip_line(focus: ReviewsComposePane) -> Line<'static> {
+    let mk = |p: ReviewsComposePane, label: &'static str| {
+        let on = focus == p;
+        Span::styled(
+            label,
+            Style::default()
+                .fg(if on { GREEN } else { SUB })
+                .add_modifier(if on {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )
+    };
+    Line::from(vec![
+        mk(ReviewsComposePane::Files, " Files "),
+        Span::styled(" │ ", Style::default().fg(SUB)),
+        mk(ReviewsComposePane::Diff, " Diff "),
+        Span::styled(" │ ", Style::default().fg(SUB)),
+        mk(ReviewsComposePane::Actions, " Finish "),
+        Span::styled(
+            "     Tab · Shift+Tab · Esc close ",
+            Style::default().fg(SUB),
+        ),
+    ])
 }
 
 fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
@@ -794,284 +1334,6 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 area,
             );
         }
-        Overlay::InlineReview {
-            phase,
-            file_cursor,
-            path,
-            diff_lines,
-            line_cursor,
-            pending_review_id,
-            commit_sha,
-            session_comments,
-            submit_cursor,
-        } => {
-            let w = (full.width * 5 / 6).max(50).min(full.width.saturating_sub(2));
-            let h = (full.height * 5 / 6).max(16).min(full.height.saturating_sub(2));
-            let x = (full.width.saturating_sub(w)) / 2;
-            let y = (full.height.saturating_sub(h)) / 2;
-            let area = Rect { x, y, width: w, height: h };
-            f.render_widget(Clear, area);
-            let shell = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN))
-                .title(Line::from(vec![
-                    Span::styled(" pull request review ", Style::default().fg(GREEN).bold()),
-                    Span::styled(
-                        format!("pending #{pending_review_id}  "),
-                        Style::default().fg(MAUVE),
-                    ),
-                    Span::styled(
-                        format!("@ {} ", &commit_sha[..commit_sha.len().min(7)]),
-                        Style::default().fg(SUB),
-                    ),
-                ]))
-                .style(Style::default().bg(SURFACE).fg(TEXT));
-            let inner = shell.inner(area);
-            f.render_widget(shell, area);
-            match *phase {
-                InlineReviewPhase::PickFile => {
-                    let rail_w = (inner.width / 3).clamp(22, 36);
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Length(rail_w), Constraint::Min(12)])
-                        .split(inner);
-                    let rail = Block::default()
-                        .borders(Borders::RIGHT)
-                        .border_style(Style::default().fg(MAUVE))
-                        .style(Style::default().bg(BG))
-                        .title(Line::from(Span::styled(
-                            " flow ",
-                            Style::default().fg(MAUVE).bold(),
-                        )));
-                    let ri = rail.inner(cols[0]);
-                    f.render_widget(rail, cols[0]);
-                    let rail_txt = Text::from(vec![
-                        Line::from(Span::styled(
-                            "1  pick file",
-                            Style::default().fg(GREEN),
-                        )),
-                        Line::from(Span::styled(
-                            "2  diff line",
-                            Style::default().fg(SUB),
-                        )),
-                        Line::from(Span::styled(
-                            "3  $EDITOR",
-                            Style::default().fg(SUB),
-                        )),
-                        Line::from(Span::styled(
-                            "S  submit",
-                            Style::default().fg(SUB),
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "Comments stack on GitHub until you submit or discard.",
-                            Style::default().fg(SUB),
-                        )),
-                    ]);
-                    f.render_widget(
-                        Paragraph::new(rail_txt).wrap(Wrap { trim: true }),
-                        ri,
-                    );
-                    let list_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT))
-                        .title(Line::from(Span::styled(
-                            " changed files  j/k Enter  mouse ",
-                            Style::default().fg(ACCENT).bold(),
-                        )));
-                    let list_inner = list_block.inner(cols[1]);
-                    app.wizard_hit_rect.set(Some(list_inner));
-                    let items: Vec<ListItem> = app
-                        .file_paths
-                        .iter()
-                        .map(|p| {
-                            ListItem::new(Span::styled(
-                                p.as_str(),
-                                Style::default().fg(SUB),
-                            ))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(list_block)
-                        .highlight_style(
-                            Style::default()
-                                .bg(BG)
-                                .fg(TEXT)
-                                .add_modifier(Modifier::BOLD),
-                        );
-                    if app.file_paths.is_empty() {
-                        app.inline_review_file_state.select(None);
-                    } else {
-                        let i = (*file_cursor).min(app.file_paths.len().saturating_sub(1));
-                        app.inline_review_file_state.select(Some(i));
-                    }
-                    f.render_stateful_widget(list, cols[1], &mut app.inline_review_file_state);
-                }
-                InlineReviewPhase::PickLine => {
-                    let use_side_by_side = inner.width >= 72;
-                    let body = if use_side_by_side {
-                        Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                            .split(inner)
-                    } else {
-                        Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-                            .split(inner)
-                    };
-                    let diff_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(PEACH))
-                        .title(Line::from(vec![
-                            Span::styled(path.as_str(), Style::default().fg(PEACH).bold()),
-                            Span::styled(
-                                "  j/k · n/p · Enter · S submit · X discard ",
-                                Style::default().fg(SUB),
-                            ),
-                        ]));
-                    let diff_inner = diff_block.inner(body[0]);
-                    app.wizard_hit_rect.set(Some(diff_inner));
-                    let items: Vec<ListItem> = diff_lines
-                        .iter()
-                        .map(|ln| {
-                            let fg = if ln.anchor.is_some() {
-                                TEXT
-                            } else {
-                                SUB
-                            };
-                            ListItem::new(Span::styled(ln.text.as_str(), Style::default().fg(fg)))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(diff_block)
-                        .highlight_style(
-                            Style::default()
-                                .bg(BG)
-                                .fg(GREEN)
-                                .add_modifier(Modifier::BOLD),
-                        );
-                    if diff_lines.is_empty() {
-                        app.inline_review_line_state.select(None);
-                    } else {
-                        let i = (*line_cursor).min(diff_lines.len().saturating_sub(1));
-                        app.inline_review_line_state.select(Some(i));
-                    }
-                    f.render_stateful_widget(list, body[0], &mut app.inline_review_line_state);
-                    let sess_title = format!(" this session ({}) ", session_comments.len());
-                    let sess_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(MAUVE))
-                        .title(Line::from(Span::styled(
-                            sess_title,
-                            Style::default().fg(MAUVE).bold(),
-                        )));
-                    let sess_i = sess_block.inner(body[1]);
-                    f.render_widget(sess_block, body[1]);
-                    let sess_body = if session_comments.is_empty() {
-                        Text::from(vec![Line::from(Span::styled(
-                            "No inline comments yet — Enter on a numbered line.",
-                            Style::default().fg(SUB).italic(),
-                        ))])
-                    } else {
-                        Text::from(
-                            session_comments
-                                .iter()
-                                .map(|s| {
-                                    Line::from(Span::styled(
-                                        PrListEntry::ellipsize(s, sess_i.width.saturating_sub(2) as usize),
-                                        Style::default().fg(TEXT),
-                                    ))
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    };
-                    f.render_widget(
-                        Paragraph::new(sess_body).wrap(Wrap { trim: true }),
-                        sess_i,
-                    );
-                }
-                InlineReviewPhase::SubmitPick => {
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Length(2), Constraint::Min(6)])
-                        .split(inner);
-                    f.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(
-                                "Submit pending review  ",
-                                Style::default().fg(GREEN).bold(),
-                            ),
-                            Span::styled(
-                                "j/k Enter · Esc back · Approve is immediate",
-                                Style::default().fg(SUB),
-                            ),
-                        ])),
-                        chunks[0],
-                    );
-                    let list_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(GREEN));
-                    let list_inner = list_block.inner(chunks[1]);
-                    app.wizard_hit_rect.set(Some(list_inner));
-                    let labels = [
-                        " APPROVE — ship it (no editor)",
-                        " REQUEST CHANGES — opens $EDITOR (body required)",
-                        " COMMENT — general feedback via $EDITOR",
-                    ];
-                    let items: Vec<ListItem> = labels
-                        .iter()
-                        .map(|l| {
-                            ListItem::new(Span::styled(
-                                *l,
-                                Style::default().fg(TEXT),
-                            ))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(list_block)
-                        .highlight_style(
-                            Style::default()
-                                .bg(BG)
-                                .fg(GREEN)
-                                .add_modifier(Modifier::BOLD),
-                        );
-                    let i = (*submit_cursor).min(2);
-                    app.inline_review_submit_state.select(Some(i));
-                    f.render_stateful_widget(
-                        list,
-                        chunks[1],
-                        &mut app.inline_review_submit_state,
-                    );
-                }
-                InlineReviewPhase::ConfirmDiscard => {
-                    app.wizard_hit_rect.set(None);
-                    let txt = Text::from(vec![
-                        Line::from(""),
-                        Line::from(
-                            Span::styled(
-                                "Discard this pending review on GitHub?",
-                                Style::default().fg(RED).bold(),
-                            ),
-                        ),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "All draft inline comments in this review will be removed.",
-                            Style::default().fg(SUB),
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "y  confirm     n / Esc  cancel",
-                            Style::default().fg(TEXT),
-                        )),
-                    ]);
-                    f.render_widget(
-                        Paragraph::new(txt).alignment(Alignment::Center),
-                        inner,
-                    );
-                }
-            }
-        }
         Overlay::CreatePrWizard {
             phase,
             title,
@@ -1138,12 +1400,14 @@ THREAD (tab 2) — review with code context\n\
   g g  G        scroll comment body top / bottom\n\
 \n\
 REVIEWS (tab 6)\n\
-  j k           scroll submitted reviews list\n\
-  a             pending review wizard (GitHub “Start review”)\n\
-                Creates or reuses your PENDING review; each Enter comment attaches to it\n\
-                S             submit: Approve (instant) | Request changes | Comment ($EDITOR)\n\
-                X             discard pending review (y confirm)\n\
-                Mouse + n/p   row pick / jump commentable diff lines · ```suggestion works on github.com\n\
+  j k           browse submitted reviews (when composer is closed)\n\
+  a             open split-pane composer (Files | Diff | Finish), like “Start a review”\n\
+                Tab / Shift+Tab   panes · Esc closes composer (pending review stays on GitHub)\n\
+                Diff: GitHub-style file view — old│new│+/- gutters; n/p jump commentable lines\n\
+                Enter         docked “Write” box under the diff (Markdown; Ctrl+Enter posts comment)\n\
+                Ctrl+e        open $EDITOR for long comments · Esc closes draft only\n\
+                Finish pane: Approve | Request changes | Comment | Discard (y confirm)\n\
+                Mouse selects pane/row when no draft is open\n\
 \n\
 FILTERS  (:command from any screen, refreshes list)\n\
   :filter clear | show    :state open|closed|merged|draft|all\n\

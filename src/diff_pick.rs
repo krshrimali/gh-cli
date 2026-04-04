@@ -1,10 +1,35 @@
 //! Slice a multi-file unified diff and map hunk lines to GitHub review-comment anchors.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffLineKind {
+    OutsideHunk,
+    HunkHeader,
+    Context,
+    Removed,
+    Added,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffDisplayLine {
-    pub text: String,
+    pub kind: DiffLineKind,
+    pub old_num: Option<u32>,
+    pub new_num: Option<u32>,
+    /// Text after the unified-diff marker (or full line for headers / outside hunk).
+    pub body: String,
     /// `(line_number, "RIGHT" | "LEFT")` when this row can host a pull review comment.
     pub anchor: Option<(u32, &'static str)>,
+}
+
+impl DiffDisplayLine {
+    pub fn marker_char(&self) -> char {
+        match self.kind {
+            DiffLineKind::Removed => '-',
+            DiffLineKind::Added => '+',
+            DiffLineKind::Context => ' ',
+            DiffLineKind::HunkHeader => '·',
+            DiffLineKind::OutsideHunk => ' ',
+        }
+    }
 }
 
 /// True if this diff chunk is for `path` (as returned by the files API).
@@ -84,7 +109,10 @@ pub fn parse_patch_lines(patch: &str) -> Vec<DiffDisplayLine> {
                 in_hunk = false;
             }
             out.push(DiffDisplayLine {
-                text: line.to_string(),
+                kind: DiffLineKind::HunkHeader,
+                old_num: None,
+                new_num: None,
+                body: line.to_string(),
                 anchor: None,
             });
             continue;
@@ -92,49 +120,65 @@ pub fn parse_patch_lines(patch: &str) -> Vec<DiffDisplayLine> {
 
         if !in_hunk || line.is_empty() {
             out.push(DiffDisplayLine {
-                text: line.to_string(),
+                kind: DiffLineKind::OutsideHunk,
+                old_num: None,
+                new_num: None,
+                body: line.to_string(),
                 anchor: None,
             });
             continue;
         }
 
         let first = line.chars().next().unwrap_or(' ');
+        let rest = line.get(1..).unwrap_or("").to_string();
 
         match first {
             ' ' => {
-                let label = format!("{new_cur:>4}→ {line}");
                 out.push(DiffDisplayLine {
-                    text: label,
+                    kind: DiffLineKind::Context,
+                    old_num: Some(old_cur),
+                    new_num: Some(new_cur),
+                    body: rest,
                     anchor: Some((new_cur, "RIGHT")),
                 });
                 old_cur = old_cur.saturating_add(1);
                 new_cur = new_cur.saturating_add(1);
             }
             '-' => {
-                let label = format!("{old_cur:>4}← {line}");
                 out.push(DiffDisplayLine {
-                    text: label,
+                    kind: DiffLineKind::Removed,
+                    old_num: Some(old_cur),
+                    new_num: None,
+                    body: rest,
                     anchor: Some((old_cur, "LEFT")),
                 });
                 old_cur = old_cur.saturating_add(1);
             }
             '+' => {
-                let label = format!("{new_cur:>4}→ {line}");
                 out.push(DiffDisplayLine {
-                    text: label,
+                    kind: DiffLineKind::Added,
+                    old_num: None,
+                    new_num: Some(new_cur),
+                    body: rest,
                     anchor: Some((new_cur, "RIGHT")),
                 });
                 new_cur = new_cur.saturating_add(1);
             }
             '\\' => {
                 out.push(DiffDisplayLine {
-                    text: line.to_string(),
+                    kind: DiffLineKind::OutsideHunk,
+                    old_num: None,
+                    new_num: None,
+                    body: line.to_string(),
                     anchor: None,
                 });
             }
             _ => {
                 out.push(DiffDisplayLine {
-                    text: line.to_string(),
+                    kind: DiffLineKind::OutsideHunk,
+                    old_num: None,
+                    new_num: None,
+                    body: line.to_string(),
                     anchor: None,
                 });
             }

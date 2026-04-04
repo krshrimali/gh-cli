@@ -7,7 +7,9 @@ use crate::ui;
 use crate::github;
 use std::collections::HashMap;
 use anyhow::Context;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::cell::Cell;
@@ -289,14 +291,46 @@ pub enum FilterPanelPhase {
     StatusPick { cursor: usize },
 }
 
+/// Focused pane in the Reviews tab **composer** (split layout, not a popup).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum InlineReviewPhase {
-    PickFile,
-    PickLine,
-    /// Choose APPROVE / REQUEST_CHANGES / COMMENT then finish (or open `$EDITOR` for text actions).
-    SubmitPick,
-    /// `X` from PickLine — confirm discarding the pending review on GitHub.
+pub enum ReviewsComposePane {
+    Files,
+    Diff,
+    Actions,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReviewsComposerSubphase {
+    Normal,
     ConfirmDiscard,
+}
+
+/// Draft text for a single pending-review inline comment (docked under the diff, GitHub-style).
+#[derive(Clone, Debug)]
+pub struct InlineCommentDraft {
+    pub path: String,
+    pub line: u32,
+    pub side: String,
+    pub chars: Vec<char>,
+    pub cursor: usize,
+}
+
+/// In-tab pending-review UI: files | diff | finish (GitHub “start review” flow).
+#[derive(Clone)]
+pub struct ReviewsComposer {
+    pub focus: ReviewsComposePane,
+    pub subphase: ReviewsComposerSubphase,
+    pub file_cursor: usize,
+    pub path: String,
+    pub diff_lines: Vec<diff_pick::DiffDisplayLine>,
+    pub line_cursor: usize,
+    pub pending_review_id: u64,
+    pub commit_sha: String,
+    pub session_comments: Vec<String>,
+    /// 0 approve, 1 request changes, 2 comment, 3 discard
+    pub submit_cursor: usize,
+    /// When set, keyboard focuses this composer (Esc / Ctrl+Enter); diff list is read-only until closed.
+    pub comment_draft: Option<InlineCommentDraft>,
 }
 
 pub(crate) fn pr_status_menu_cursor(st: github::PrStatusFilter) -> usize {
@@ -324,19 +358,6 @@ pub enum Overlay {
     },
     /// PR filters + status (`f`; `s` opens status, `A` jumps to status).
     FilterSummary(FilterPanelPhase),
-    /// Reviews tab: GitHub **pending review** — pick file → diff line → `$EDITOR` → attach comment;
-    /// `S` submit (approve / request changes / comment), `X` discard pending.
-    InlineReview {
-        phase: InlineReviewPhase,
-        file_cursor: usize,
-        path: String,
-        diff_lines: Vec<diff_pick::DiffDisplayLine>,
-        line_cursor: usize,
-        pending_review_id: u64,
-        commit_sha: String,
-        session_comments: Vec<String>,
-        submit_cursor: usize,
-    },
 }
 
 pub enum EditorIntent {
@@ -437,8 +458,11 @@ pub struct App {
     pub inline_review_file_state: ListState,
     pub inline_review_line_state: ListState,
     pub inline_review_submit_state: ListState,
-    /// Inner rect of the inline-review list (mouse row → index).
-    pub wizard_hit_rect: Cell<Option<Rect>>,
+    /// Reviews tab: split-pane composer (`a`), None = browse submitted reviews list.
+    pub reviews_composer: Option<ReviewsComposer>,
+    pub compose_hit_files: Cell<Option<Rect>>,
+    pub compose_hit_diff: Cell<Option<Rect>>,
+    pub compose_hit_actions: Cell<Option<Rect>>,
     pub overlay: Overlay,
     pub command_buf: String,
     pub vim_g_pending: bool,
@@ -502,7 +526,10 @@ impl App {
             inline_review_file_state: ListState::default(),
             inline_review_line_state: ListState::default(),
             inline_review_submit_state: ListState::default(),
-            wizard_hit_rect: Cell::new(None),
+            reviews_composer: None,
+            compose_hit_files: Cell::new(None),
+            compose_hit_diff: Cell::new(None),
+            compose_hit_actions: Cell::new(None),
             overlay: Overlay::None,
             command_buf: String::new(),
             vim_g_pending: false,
@@ -859,6 +886,7 @@ impl App {
         self.review_cursor = 0;
         self.thread_list_state = ListState::default();
         self.review_list_state = ListState::default();
+        self.reviews_composer = None;
     }
 
     fn load_thread(&mut self, rt: &Runtime) -> anyhow::Result<()> {
@@ -1202,39 +1230,16 @@ impl App {
                 line,
                 side,
             } => {
-                let r = rt.block_on(github::create_pull_review_inline_comment(
-                    &self.octo,
-                    &self.owner,
-                    &self.repo,
+                let _ = self.finish_pending_inline_comment(
+                    rt,
                     pr,
+                    pending_review_id,
                     &commit_sha,
                     &path,
                     line,
                     &side,
                     &body,
-                    Some(pending_review_id),
-                ));
-                match r {
-                    Ok(_) => {
-                        let peek = PrListEntry::ellipsize(
-                            body.lines().next().unwrap_or("(empty)"),
-                            72,
-                        );
-                        let summary = format!("`{path}` L{line}: {peek}");
-                        if let Overlay::InlineReview {
-                            session_comments,
-                            ..
-                        } = &mut self.overlay
-                        {
-                            session_comments.push(summary);
-                        }
-                        self.set_status(format!(
-                            "added to pending review #{pending_review_id} — S submit · more comments · X discard"
-                        ));
-                        let _ = self.load_thread(rt);
-                    }
-                    Err(e) => self.set_status(format!("inline comment: {e:#}")),
-                }
+                );
             }
             EditorIntent::SubmitPullReview { review_id, action } => {
                 let Some(pr_n) = self.pr_number else {
@@ -1257,7 +1262,7 @@ impl App {
                             ReviewAction::Comment => "Review submitted: COMMENT",
                             _ => "Review submitted",
                         });
-                        self.overlay = Overlay::None;
+                        self.reviews_composer = None;
                         let _ = self.load_thread(rt);
                         let _ = self.load_reviews(rt);
                     }
@@ -1386,242 +1391,6 @@ impl App {
                 }
                 Ok(AppEffect::None)
             }
-            Overlay::InlineReview {
-                phase,
-                file_cursor,
-                path,
-                diff_lines,
-                line_cursor,
-                pending_review_id,
-                commit_sha,
-                session_comments: _session_comments,
-                submit_cursor,
-            } => match *phase {
-                InlineReviewPhase::PickFile => {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            self.overlay = Overlay::None;
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !self.file_paths.is_empty() {
-                                *file_cursor =
-                                    (*file_cursor + 1).min(self.file_paths.len() - 1);
-                            }
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            *file_cursor = file_cursor.saturating_sub(1);
-                        }
-                        KeyCode::Enter => {
-                            if self.file_paths.is_empty() {
-                                self.set_status("no files on this PR");
-                            } else if let Some(p) = self.file_paths.get(*file_cursor).cloned() {
-                                match diff_pick::extract_file_patch(&self.diff_text, &p) {
-                                    None => self.set_status(format!("no diff chunk for `{p}`")),
-                                    Some(chunk) => {
-                                        if chunk.contains("Binary files ")
-                                            && chunk.contains(" differ")
-                                        {
-                                            self.set_status("binary file — pick another");
-                                        } else {
-                                            let lines = diff_pick::parse_patch_lines(chunk);
-                                            if diff_pick::first_anchor_index(&lines).is_none() {
-                                                self.set_status(
-                                                    "no commentable lines in this diff chunk",
-                                                );
-                                            } else {
-                                                *phase = InlineReviewPhase::PickLine;
-                                                *path = p;
-                                                *diff_lines = lines;
-                                                *line_cursor = diff_pick::first_anchor_index(
-                                                    diff_lines,
-                                                )
-                                                .unwrap_or(0);
-                                                self.inline_review_line_state =
-                                                    ListState::default();
-                                                self.set_status(
-                                                    "Enter comment · S submit review · X discard pending · Esc file · q close",
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    Ok(AppEffect::None)
-                }
-                InlineReviewPhase::PickLine => match key.code {
-                    KeyCode::Esc => {
-                        *phase = InlineReviewPhase::PickFile;
-                        diff_lines.clear();
-                        path.clear();
-                        self.inline_review_line_state = ListState::default();
-                        self.set_status("pick a file (Enter)");
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('q') => {
-                        self.overlay = Overlay::None;
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('S') => {
-                        *phase = InlineReviewPhase::SubmitPick;
-                        *submit_cursor = 0;
-                        self.inline_review_submit_state = ListState::default();
-                        self.set_status(
-                            "finish review — j/k Enter · Approve is instant; others open $EDITOR",
-                        );
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('x') => {
-                        *phase = InlineReviewPhase::ConfirmDiscard;
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !diff_lines.is_empty() {
-                            *line_cursor = (*line_cursor + 1).min(diff_lines.len() - 1);
-                        }
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        *line_cursor = line_cursor.saturating_sub(1);
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('n') => {
-                        if !diff_lines.is_empty() {
-                            *line_cursor =
-                                diff_pick::step_anchor(*line_cursor, diff_lines, true);
-                        }
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('p') => {
-                        if !diff_lines.is_empty() {
-                            *line_cursor =
-                                diff_pick::step_anchor(*line_cursor, diff_lines, false);
-                        }
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Enter => {
-                        let Some(n) = self.pr_number else {
-                            return Ok(AppEffect::None);
-                        };
-                        if let Some(dl) = diff_lines.get(*line_cursor) {
-                            if let Some((line, side)) = dl.anchor {
-                                let initial = format!(
-                                    "## `{path}` line {line} ({side})\n\n\
-Comment (markdown). Optional suggestion block:\n\n\
-```suggestion\n\n```\n",
-                                    path = path.as_str(),
-                                    line = line,
-                                    side = side,
-                                );
-                                return Ok(AppEffect::OpenEditor {
-                                    initial,
-                                    intent: EditorIntent::InlineReviewComment {
-                                        pr: n,
-                                        pending_review_id: *pending_review_id,
-                                        commit_sha: commit_sha.clone(),
-                                        path: path.clone(),
-                                        line,
-                                        side: side.to_string(),
-                                    },
-                                });
-                            }
-                        }
-                        self.set_status("select a numbered diff row (n / p jump commentable lines)");
-                        Ok(AppEffect::None)
-                    }
-                    _ => Ok(AppEffect::None),
-                },
-                InlineReviewPhase::SubmitPick => match key.code {
-                    KeyCode::Esc => {
-                        *phase = InlineReviewPhase::PickLine;
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        *submit_cursor = (*submit_cursor + 1).min(2);
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        *submit_cursor = submit_cursor.saturating_sub(1);
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Enter => {
-                        let Some(n) = self.pr_number else {
-                            return Ok(AppEffect::None);
-                        };
-                        let rid = *pending_review_id;
-                        match *submit_cursor {
-                            0 => {
-                                let r = rt.block_on(github::submit_pull_review(
-                                    &self.octo,
-                                    &self.owner,
-                                    &self.repo,
-                                    n,
-                                    rid,
-                                    ReviewAction::Approve,
-                                    "",
-                                ));
-                                match r {
-                                    Ok(_) => {
-                                        self.set_status("Review submitted: APPROVED");
-                                        self.overlay = Overlay::None;
-                                        let _ = self.load_thread(rt);
-                                        let _ = self.load_reviews(rt);
-                                    }
-                                    Err(e) => self.set_status(format!("submit: {e:#}")),
-                                }
-                                Ok(AppEffect::None)
-                            }
-                            1 => Ok(AppEffect::OpenEditor {
-                                initial: "## Request changes\n\nExplain what should be fixed.\n\n"
-                                    .to_string(),
-                                intent: EditorIntent::SubmitPullReview {
-                                    review_id: rid,
-                                    action: ReviewAction::RequestChanges,
-                                },
-                            }),
-                            2 => Ok(AppEffect::OpenEditor {
-                                initial: "## Comment\n\nGeneral review feedback.\n\n".to_string(),
-                                intent: EditorIntent::SubmitPullReview {
-                                    review_id: rid,
-                                    action: ReviewAction::Comment,
-                                },
-                            }),
-                            _ => Ok(AppEffect::None),
-                        }
-                    }
-                    _ => Ok(AppEffect::None),
-                },
-                InlineReviewPhase::ConfirmDiscard => match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') => {
-                        *phase = InlineReviewPhase::PickLine;
-                        Ok(AppEffect::None)
-                    }
-                    KeyCode::Char('y') => {
-                        let Some(n) = self.pr_number else {
-                            return Ok(AppEffect::None);
-                        };
-                        let rid = *pending_review_id;
-                        let r = rt.block_on(github::delete_pending_pull_review(
-                            &self.octo,
-                            &self.owner,
-                            &self.repo,
-                            n,
-                            rid,
-                        ));
-                        match r {
-                            Ok(_) => {
-                                self.set_status("pending review discarded on GitHub");
-                                self.overlay = Overlay::None;
-                            }
-                            Err(e) => self.set_status(format!("discard review: {e:#}")),
-                        }
-                        Ok(AppEffect::None)
-                    }
-                    _ => Ok(AppEffect::None),
-                },
-            },
             Overlay::CreatePrWizard {
                 phase,
                 title,
@@ -2022,6 +1791,12 @@ Comment (markdown). Optional suggestion block:\n\n\
             return Ok(AppEffect::None);
         }
 
+        if self.pr_tab == PrTab::Reviews && self.reviews_composer.is_some() {
+            if let Some(eff) = self.handle_reviews_composer_key(key, rt)? {
+                return Ok(eff);
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 self.screen = Screen::PrList;
@@ -2215,6 +1990,9 @@ Comment (markdown). Optional suggestion block:\n\n\
             KeyCode::Char(c) if matches!(c, '1'..='6') => {
                 if let Some(d) = c.to_digit(10) {
                     if let Some(tab) = PrTab::from_digit(d as u8) {
+                        if tab != PrTab::Reviews {
+                            self.reviews_composer = None;
+                        }
                         self.pr_tab = tab;
                         self.tab_scroll = 0;
                         let _ = self.ensure_tab_loaded(rt);
@@ -2228,7 +2006,293 @@ Comment (markdown). Optional suggestion block:\n\n\
         Ok(AppEffect::None)
     }
 
+    /// `Some` = key consumed (return from `handle_pr_detail`). `None` = fall through to normal PR keys.
+    fn handle_reviews_composer_key(
+        &mut self,
+        key: KeyEvent,
+        rt: &Runtime,
+    ) -> anyhow::Result<Option<AppEffect>> {
+        if self.reviews_composer.is_none() {
+            return Ok(None);
+        }
+
+        if self.reviews_composer.as_ref().unwrap().subphase
+            == ReviewsComposerSubphase::ConfirmDiscard
+        {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.reviews_composer.as_mut().unwrap().subphase =
+                        ReviewsComposerSubphase::Normal;
+                }
+                KeyCode::Char('y') => {
+                    let Some(n) = self.pr_number else {
+                        return Ok(Some(AppEffect::None));
+                    };
+                    let rid = self.reviews_composer.as_ref().unwrap().pending_review_id;
+                    let r = rt.block_on(github::delete_pending_pull_review(
+                        &self.octo,
+                        &self.owner,
+                        &self.repo,
+                        n,
+                        rid,
+                    ));
+                    match r {
+                        Ok(_) => {
+                            self.set_status("pending review discarded on GitHub");
+                            self.reviews_composer = None;
+                        }
+                        Err(e) => self.set_status(format!("discard review: {e:#}")),
+                    }
+                }
+                _ => {}
+            }
+            return Ok(Some(AppEffect::None));
+        }
+
+        if self
+            .reviews_composer
+            .as_ref()
+            .is_some_and(|c| c.comment_draft.is_some())
+        {
+            return self.handle_reviews_comment_draft_key(key, rt);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.reviews_composer = None;
+                self.set_status(
+                    "left composer — pending review still on GitHub (submit or discard there / reopen a)",
+                );
+                return Ok(Some(AppEffect::None));
+            }
+            KeyCode::Tab => {
+                let c = self.reviews_composer.as_mut().unwrap();
+                c.focus = match c.focus {
+                    ReviewsComposePane::Files => ReviewsComposePane::Diff,
+                    ReviewsComposePane::Diff => ReviewsComposePane::Actions,
+                    ReviewsComposePane::Actions => ReviewsComposePane::Files,
+                };
+                return Ok(Some(AppEffect::None));
+            }
+            KeyCode::BackTab => {
+                let c = self.reviews_composer.as_mut().unwrap();
+                c.focus = match c.focus {
+                    ReviewsComposePane::Files => ReviewsComposePane::Actions,
+                    ReviewsComposePane::Diff => ReviewsComposePane::Files,
+                    ReviewsComposePane::Actions => ReviewsComposePane::Diff,
+                };
+                return Ok(Some(AppEffect::None));
+            }
+            _ => {}
+        }
+
+        let comp = self.reviews_composer.as_mut().unwrap();
+        match comp.focus {
+            ReviewsComposePane::Files => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !self.file_paths.is_empty() {
+                        comp.file_cursor =
+                            (comp.file_cursor + 1).min(self.file_paths.len() - 1);
+                    }
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    comp.file_cursor = comp.file_cursor.saturating_sub(1);
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Enter => {
+                    if self.file_paths.is_empty() {
+                        self.set_status("no files on this PR");
+                    } else if let Some(p) = self.file_paths.get(comp.file_cursor).cloned() {
+                        match diff_pick::extract_file_patch(&self.diff_text, &p) {
+                            None => self.set_status(format!("no diff chunk for `{p}`")),
+                            Some(chunk) => {
+                                if chunk.contains("Binary files ") && chunk.contains(" differ") {
+                                    self.set_status("binary file — pick another");
+                                } else {
+                                    let lines = diff_pick::parse_patch_lines(chunk);
+                                    if diff_pick::first_anchor_index(&lines).is_none() {
+                                        self.set_status("no commentable lines in this chunk");
+                                    } else {
+                                        comp.path = p;
+                                        comp.diff_lines = lines;
+                                        comp.line_cursor = diff_pick::first_anchor_index(
+                                            &comp.diff_lines,
+                                        )
+                                        .unwrap_or(0);
+                                        comp.focus = ReviewsComposePane::Diff;
+                                        self.inline_review_line_state = ListState::default();
+                                        self.set_status(
+                                            "Diff: Enter on a line with + opens Write box · n/p · Tab",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Some(AppEffect::None))
+                }
+                _ => Ok(None),
+            },
+            ReviewsComposePane::Diff => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !comp.diff_lines.is_empty() {
+                        comp.line_cursor =
+                            (comp.line_cursor + 1).min(comp.diff_lines.len() - 1);
+                    }
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    comp.line_cursor = comp.line_cursor.saturating_sub(1);
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('n') => {
+                    if !comp.diff_lines.is_empty() {
+                        comp.line_cursor = diff_pick::step_anchor(
+                            comp.line_cursor,
+                            &comp.diff_lines,
+                            true,
+                        );
+                    }
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('p') => {
+                    if !comp.diff_lines.is_empty() {
+                        comp.line_cursor = diff_pick::step_anchor(
+                            comp.line_cursor,
+                            &comp.diff_lines,
+                            false,
+                        );
+                    }
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Enter => {
+                    if comp.path.is_empty() {
+                        self.set_status("Files pane: Enter loads a diff into this pane");
+                        return Ok(Some(AppEffect::None));
+                    }
+                    if let Some(dl) = comp.diff_lines.get(comp.line_cursor) {
+                        if let Some((line, side)) = dl.anchor {
+                            let path = comp.path.clone();
+                            comp.comment_draft = Some(InlineCommentDraft {
+                                path,
+                                line,
+                                side: side.to_string(),
+                                chars: Vec::new(),
+                                cursor: 0,
+                            });
+                            self.set_status(
+                                "Write below (like GitHub) · Ctrl+Enter post · Esc cancel · Ctrl+e $EDITOR",
+                            );
+                            return Ok(Some(AppEffect::None));
+                        }
+                    }
+                    self.set_status("Pick a line with a + affordance (n/p jump commentable rows)");
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let Some(n) = self.pr_number else {
+                        return Ok(Some(AppEffect::None));
+                    };
+                    if comp.path.is_empty() {
+                        self.set_status("Load a file diff first (Files pane · Enter)");
+                        return Ok(Some(AppEffect::None));
+                    }
+                    let pend = comp.pending_review_id;
+                    let sha = comp.commit_sha.clone();
+                    let path = comp.path.clone();
+                    if let Some(dl) = comp.diff_lines.get(comp.line_cursor) {
+                        if let Some((line, side)) = dl.anchor {
+                            let initial = format!(
+                                "## `{path}` line {line} ({side})\n\n\
+Comment (markdown). Optional suggestion:\n\n\
+```suggestion\n\n```\n",
+                            );
+                            return Ok(Some(AppEffect::OpenEditor {
+                                initial,
+                                intent: EditorIntent::InlineReviewComment {
+                                    pr: n,
+                                    pending_review_id: pend,
+                                    commit_sha: sha,
+                                    path,
+                                    line,
+                                    side: side.to_string(),
+                                },
+                            }));
+                        }
+                    }
+                    self.set_status("Move to a commentable line first (n/p)");
+                    Ok(Some(AppEffect::None))
+                }
+                _ => Ok(None),
+            },
+            ReviewsComposePane::Actions => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    comp.submit_cursor = (comp.submit_cursor + 1).min(3);
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    comp.submit_cursor = comp.submit_cursor.saturating_sub(1);
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Enter => {
+                    let Some(n) = self.pr_number else {
+                        return Ok(Some(AppEffect::None));
+                    };
+                    let rid = comp.pending_review_id;
+                    match comp.submit_cursor {
+                        0 => {
+                            let r = rt.block_on(github::submit_pull_review(
+                                &self.octo,
+                                &self.owner,
+                                &self.repo,
+                                n,
+                                rid,
+                                ReviewAction::Approve,
+                                "",
+                            ));
+                            match r {
+                                Ok(_) => {
+                                    self.set_status("Review submitted: APPROVED");
+                                    self.reviews_composer = None;
+                                    let _ = self.load_thread(rt);
+                                    let _ = self.load_reviews(rt);
+                                }
+                                Err(e) => self.set_status(format!("submit: {e:#}")),
+                            }
+                            Ok(Some(AppEffect::None))
+                        }
+                        1 => Ok(Some(AppEffect::OpenEditor {
+                            initial: "## Request changes\n\n".to_string(),
+                            intent: EditorIntent::SubmitPullReview {
+                                review_id: rid,
+                                action: ReviewAction::RequestChanges,
+                            },
+                        })),
+                        2 => Ok(Some(AppEffect::OpenEditor {
+                            initial: "## Comment\n\n".to_string(),
+                            intent: EditorIntent::SubmitPullReview {
+                                review_id: rid,
+                                action: ReviewAction::Comment,
+                            },
+                        })),
+                        3 => {
+                            comp.subphase = ReviewsComposerSubphase::ConfirmDiscard;
+                            Ok(Some(AppEffect::None))
+                        }
+                        _ => Ok(Some(AppEffect::None)),
+                    }
+                }
+                _ => Ok(None),
+            },
+        }
+    }
+
     fn start_inline_review_wizard(&mut self, rt: &Runtime) -> anyhow::Result<()> {
+        if self.reviews_composer.is_some() {
+            self.set_status("already in review composer — Esc to close");
+            return Ok(());
+        }
         let Some(n) = self.pr_number else {
             return Ok(());
         };
@@ -2270,8 +2334,9 @@ Comment (markdown). Optional suggestion block:\n\n\
         self.inline_review_file_state = ListState::default();
         self.inline_review_line_state = ListState::default();
         self.inline_review_submit_state = ListState::default();
-        self.overlay = Overlay::InlineReview {
-            phase: InlineReviewPhase::PickFile,
+        self.reviews_composer = Some(ReviewsComposer {
+            focus: ReviewsComposePane::Files,
+            subphase: ReviewsComposerSubphase::Normal,
             file_cursor: 0,
             path: String::new(),
             diff_lines: Vec::new(),
@@ -2280,55 +2345,61 @@ Comment (markdown). Optional suggestion block:\n\n\
             commit_sha,
             session_comments: Vec::new(),
             submit_cursor: 0,
-        };
+            comment_draft: None,
+        });
+        self.pr_tab = PrTab::Reviews;
         self.set_status(format!(
-            "pending review #{pending_review_id} — pick file · comments attach until you press S"
+            "composer: Tab switches panes (Files → Diff → Finish) · pending #{pending_review_id}"
         ));
         Ok(())
     }
 
-    fn handle_inline_review_mouse(&mut self, m: MouseEvent) {
-        let Some(r) = self.wizard_hit_rect.get() else {
+    fn handle_reviews_compose_mouse(&mut self, m: MouseEvent) {
+        fn inside(col: u16, row: u16, r: Rect) -> bool {
+            col >= r.x
+                && col < r.x.saturating_add(r.width)
+                && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        }
+        let Some(comp) = self.reviews_composer.as_mut() else {
             return;
         };
-        if m.column < r.x
-            || m.column >= r.x.saturating_add(r.width)
-            || m.row < r.y
-            || m.row >= r.y.saturating_add(r.height)
-        {
+        if comp.comment_draft.is_some() {
             return;
         }
-        let dy = (m.row - r.y) as usize;
-        match &mut self.overlay {
-            Overlay::InlineReview {
-                phase: InlineReviewPhase::PickFile,
-                file_cursor,
-                ..
-            } => {
+        if comp.subphase == ReviewsComposerSubphase::ConfirmDiscard {
+            return;
+        }
+        let col = m.column;
+        let row = m.row;
+        if let Some(r) = self.compose_hit_files.get() {
+            if inside(col, row, r) {
+                comp.focus = ReviewsComposePane::Files;
+                let dy = (row - r.y) as usize;
                 if dy < self.file_paths.len() {
-                    *file_cursor = dy;
+                    comp.file_cursor = dy;
+                }
+                return;
+            }
+        }
+        if let Some(r) = self.compose_hit_diff.get() {
+            if inside(col, row, r) {
+                comp.focus = ReviewsComposePane::Diff;
+                let dy = (row - r.y) as usize;
+                if dy < comp.diff_lines.len() {
+                    comp.line_cursor = dy;
+                }
+                return;
+            }
+        }
+        if let Some(r) = self.compose_hit_actions.get() {
+            if inside(col, row, r) {
+                comp.focus = ReviewsComposePane::Actions;
+                let dy = (row - r.y) as usize;
+                if dy <= 3 {
+                    comp.submit_cursor = dy;
                 }
             }
-            Overlay::InlineReview {
-                phase: InlineReviewPhase::PickLine,
-                line_cursor,
-                diff_lines,
-                ..
-            } => {
-                if dy < diff_lines.len() {
-                    *line_cursor = dy;
-                }
-            }
-            Overlay::InlineReview {
-                phase: InlineReviewPhase::SubmitPick,
-                submit_cursor,
-                ..
-            } => {
-                if dy <= 2 {
-                    *submit_cursor = dy;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -2479,12 +2550,15 @@ Comment (markdown). Optional suggestion block:\n\n\
                 self.overlay = Overlay::None;
                 return Ok(());
             }
-            Overlay::InlineReview { .. } => {
-                self.handle_inline_review_mouse(m);
-                return Ok(());
-            }
             Overlay::None => {}
             _ => return Ok(()),
+        }
+        if self.screen == Screen::PrDetail
+            && self.pr_tab == PrTab::Reviews
+            && self.reviews_composer.is_some()
+        {
+            self.handle_reviews_compose_mouse(m);
+            return Ok(());
         }
         if self.screen == Screen::PrList {
             if let Some(i) = self.pr_list_row_at_click(m.column, m.row) {
@@ -2559,6 +2633,318 @@ Comment (markdown). Optional suggestion block:\n\n\
             }
         }
     }
+
+    /// Post one inline comment on the current pending review (shared by $EDITOR and in-tab draft).
+    fn finish_pending_inline_comment(
+        &mut self,
+        rt: &Runtime,
+        pr: u64,
+        pending_review_id: u64,
+        commit_sha: &str,
+        path: &str,
+        line: u32,
+        side: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        let r = rt.block_on(github::create_pull_review_inline_comment(
+            &self.octo,
+            &self.owner,
+            &self.repo,
+            pr,
+            commit_sha,
+            path,
+            line,
+            side,
+            body,
+            Some(pending_review_id),
+        ));
+        match r {
+            Ok(_) => {
+                let peek = PrListEntry::ellipsize(body.lines().next().unwrap_or("(empty)"), 72);
+                let summary = format!("`{path}` L{line}: {peek}");
+                if let Some(comp) = &mut self.reviews_composer {
+                    comp.session_comments.push(summary);
+                }
+                self.set_status(format!(
+                    "added to pending review #{pending_review_id} — pick another line or ▸ Finish"
+                ));
+                let _ = self.load_thread(rt);
+                Ok(())
+            }
+            Err(e) => {
+                self.set_status(format!("inline comment: {e:#}"));
+                Err(e.into())
+            }
+        }
+    }
+
+    fn handle_reviews_comment_draft_key(
+        &mut self,
+        key: KeyEvent,
+        rt: &Runtime,
+    ) -> anyhow::Result<Option<AppEffect>> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(Some(AppEffect::None));
+        }
+        let pr_n = self.pr_number;
+        if !self
+            .reviews_composer
+            .as_ref()
+            .is_some_and(|c| c.comment_draft.is_some())
+        {
+            return Ok(Some(AppEffect::None));
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(c) = self.reviews_composer.as_mut() {
+                    c.comment_draft = None;
+                }
+                self.set_status("comment draft closed");
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Enter if ctrl => {
+                let (body, path, line, side, pend, sha) = {
+                    let c = self.reviews_composer.as_mut().unwrap();
+                    let d = c.comment_draft.as_ref().unwrap();
+                    (
+                        d.chars.iter().collect::<String>(),
+                        d.path.clone(),
+                        d.line,
+                        d.side.clone(),
+                        c.pending_review_id,
+                        c.commit_sha.clone(),
+                    )
+                };
+                let trimmed = body.trim();
+                if trimmed.is_empty() {
+                    self.set_status("empty comment — add text or Esc");
+                    return Ok(Some(AppEffect::None));
+                }
+                let Some(pr) = pr_n else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let ok = self
+                    .finish_pending_inline_comment(
+                        rt, pr, pend, &sha, &path, line, &side, trimmed,
+                    )
+                    .is_ok();
+                if ok {
+                    if let Some(c) = self.reviews_composer.as_mut() {
+                        c.comment_draft = None;
+                    }
+                }
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Char('e') if ctrl => {
+                let Some(pr) = pr_n else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let Some(taken) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.take())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let path = taken.path;
+                let line = taken.line;
+                let side = taken.side;
+                let (pend, sha) = {
+                    let c = self.reviews_composer.as_ref().unwrap();
+                    (c.pending_review_id, c.commit_sha.clone())
+                };
+                let initial: String = taken.chars.iter().collect();
+                let initial = if initial.trim().is_empty() {
+                    format!("## `{path}` line {line} ({side})\n\n")
+                } else {
+                    initial
+                };
+                Ok(Some(AppEffect::OpenEditor {
+                    initial,
+                    intent: EditorIntent::InlineReviewComment {
+                        pr,
+                        pending_review_id: pend,
+                        commit_sha: sha,
+                        path,
+                        line,
+                        side,
+                    },
+                }))
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let i = d.cursor.min(d.chars.len());
+                d.chars.insert(i, c);
+                d.cursor = i + 1;
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Backspace => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                if d.cursor > 0 {
+                    d.cursor -= 1;
+                    d.chars.remove(d.cursor);
+                }
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Delete => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                if d.cursor < d.chars.len() {
+                    d.chars.remove(d.cursor);
+                }
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Left => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                d.cursor = d.cursor.saturating_sub(1);
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Right => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                if d.cursor < d.chars.len() {
+                    d.cursor += 1;
+                }
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Home => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                d.cursor = draft_line_start(&d.chars, d.cursor);
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::End => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                d.cursor = draft_line_end(&d.chars, d.cursor);
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Up => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                d.cursor = draft_move_up(&d.chars, d.cursor);
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Down => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                d.cursor = draft_move_down(&d.chars, d.cursor);
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Enter => {
+                let Some(d) = self
+                    .reviews_composer
+                    .as_mut()
+                    .and_then(|c| c.comment_draft.as_mut())
+                else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let i = d.cursor.min(d.chars.len());
+                d.chars.insert(i, '\n');
+                d.cursor = i + 1;
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Tab => Ok(Some(AppEffect::None)),
+            _ => Ok(Some(AppEffect::None)),
+        }
+    }
+}
+
+fn draft_line_start(chars: &[char], pos: usize) -> usize {
+    let pos = pos.min(chars.len());
+    chars[..pos]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0)
+}
+
+fn draft_line_end(chars: &[char], pos: usize) -> usize {
+    let pos = pos.min(chars.len());
+    chars[pos..]
+        .iter()
+        .position(|c| *c == '\n')
+        .map(|i| pos + i)
+        .unwrap_or(chars.len())
+}
+
+fn draft_move_up(chars: &[char], cur: usize) -> usize {
+    let ls = draft_line_start(chars, cur);
+    if ls == 0 {
+        return 0;
+    }
+    let prev_line_end = ls.saturating_sub(1);
+    let prev_start = draft_line_start(chars, prev_line_end);
+    let col = cur.saturating_sub(ls);
+    let prev_len = prev_line_end.saturating_sub(prev_start);
+    let target_col = col.min(prev_len);
+    prev_start + target_col
+}
+
+fn draft_move_down(chars: &[char], cur: usize) -> usize {
+    let le = draft_line_end(chars, cur);
+    if le >= chars.len() {
+        return cur;
+    }
+    let next_start = le + 1;
+    let next_end = draft_line_end(chars, next_start);
+    let ls = draft_line_start(chars, cur);
+    let col = cur.saturating_sub(ls);
+    let next_len = next_end.saturating_sub(next_start);
+    let target_col = col.min(next_len);
+    next_start + target_col
 }
 
 fn reaction_kind_label(c: &ReactionContent) -> &'static str {
