@@ -482,6 +482,23 @@ pub async fn delete_pending_pull_review(
         .await?)
 }
 
+/// Drop the given user's **pending** review on this PR (if any). Use when GitHub returns
+/// "only one pending review per pull request" or to clear a review started on the website.
+pub async fn delete_pending_review_for_login(
+    oct: &Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    login: &str,
+) -> anyhow::Result<Option<u64>> {
+    let reviews = list_reviews(oct, owner, repo, pr_number).await?;
+    let Some(id) = find_pending_review_id_for_user(&reviews, login) else {
+        return Ok(None);
+    };
+    delete_pending_pull_review(oct, owner, repo, pr_number, id).await?;
+    Ok(Some(id))
+}
+
 pub async fn create_issue_comment(
     oct: &Octocrab,
     owner: &str,
@@ -551,7 +568,13 @@ pub async fn reply_to_review_comment(
 }
 
 /// Inline review comment on a PR diff line ([REST](https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request)).
-/// With `pull_request_review_id`, attaches to an existing **pending** review (GitHub.com “Start review” flow).
+///
+/// Do **not** send `pull_request_review_id` in the JSON body: it is not in GitHub’s published
+/// request schema and the API rejects the whole payload (422 / oneOf), which surfaces as errors
+/// about `line` / `positioning` being wrong. Comments are still attached to your open **pending**
+/// review on that PR when one exists (same behavior as starting a review on github.com).
+///
+/// For multi-line comments set `start_line` / `start_side` (same side as `line` / `side`).
 pub async fn create_pull_review_inline_comment(
     oct: &Octocrab,
     owner: &str,
@@ -562,7 +585,8 @@ pub async fn create_pull_review_inline_comment(
     line: u32,
     side: &str,
     body: &str,
-    pull_request_review_id: Option<u64>,
+    start_line: Option<u32>,
+    start_side: Option<&str>,
 ) -> anyhow::Result<PullComment> {
     let route = format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments");
     let mut payload = serde_json::json!({
@@ -572,11 +596,12 @@ pub async fn create_pull_review_inline_comment(
         "line": line,
         "side": side,
     });
-    if let Some(rid) = pull_request_review_id {
-        payload
-            .as_object_mut()
-            .expect("json object")
-            .insert("pull_request_review_id".into(), serde_json::json!(rid));
+    let obj = payload.as_object_mut().expect("json object");
+    if let Some(sl) = start_line {
+        obj.insert("start_line".into(), serde_json::json!(sl));
+    }
+    if let Some(ss) = start_side {
+        obj.insert("start_side".into(), serde_json::json!(ss));
     }
     Ok(oct.post(route.as_str(), Some(&payload)).await?)
 }

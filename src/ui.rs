@@ -1,8 +1,8 @@
 //! Layout and styling (Catppuccin-inspired palette on dark backgrounds).
 
 use crate::app::{
-    App, FilterPanelPhase, InlineCommentDraft, Overlay, PrListEntry, PrTab, ReviewsComposePane,
-    ReviewsComposerSubphase, Screen, ThreadItem,
+    App, FilterPanelPhase, HelpContext, InlineCommentDraft, Overlay, PrListEntry, PrTab,
+    ReviewsComposePane, ReviewsComposerSubphase, Screen, ThreadItem,
 };
 use crate::diff_pick::{DiffDisplayLine, DiffLineKind};
 use crate::github;
@@ -211,38 +211,43 @@ fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(18), Constraint::Min(0)])
-        .split(area);
+    let main = if app.hide_tab_rail {
+        area
+    } else {
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(18), Constraint::Min(0)])
+            .split(area);
 
-    let tabs: Vec<Line> = [
-        PrTab::Info,
-        PrTab::Thread,
-        PrTab::Commits,
-        PrTab::Files,
-        PrTab::Diff,
-        PrTab::Reviews,
-    ]
-    .iter()
-    .map(|t| {
-        let active = *t == app.pr_tab;
-        Line::from(Span::styled(
-            t.label(),
-            Style::default().fg(if active { GREEN } else { SUB }).bold(),
-        ))
-    })
-    .collect();
+        let tabs: Vec<Line> = [
+            PrTab::Info,
+            PrTab::Thread,
+            PrTab::Commits,
+            PrTab::Files,
+            PrTab::Diff,
+            PrTab::Reviews,
+        ]
+        .iter()
+        .map(|t| {
+            let active = *t == app.pr_tab;
+            Line::from(Span::styled(
+                t.label(),
+                Style::default().fg(if active { GREEN } else { SUB }).bold(),
+            ))
+        })
+        .collect();
 
-    let tab_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(MAUVE))
-        .title(Line::from(Span::styled(" tabs ", Style::default().fg(MAUVE))));
-    let tab_inner = tab_block.inner(h_chunks[0]);
-    f.render_widget(tab_block, h_chunks[0]);
-    f.render_widget(Paragraph::new(tabs), tab_inner);
+        let tab_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MAUVE))
+            .title(Line::from(Span::styled(" tabs ", Style::default().fg(MAUVE))));
+        let tab_inner = tab_block.inner(h_chunks[0]);
+        f.render_widget(tab_block, h_chunks[0]);
+        f.render_widget(Paragraph::new(tabs), tab_inner);
 
-    let main = h_chunks[1];
+        h_chunks[1]
+    };
+
     if let Some(pr) = app.current_pr.clone() {
         let title = pr.title.as_deref().unwrap_or("(no title)");
         let head = Line::from(vec![
@@ -260,38 +265,51 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             pr.deletions.unwrap_or(0),
             pr.changed_files.unwrap_or(0),
         );
-        let header_h = 4u16;
-        let v = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(header_h),
-                Constraint::Min(0),
-            ])
-            .split(main);
+        let hide_header = app.maximize_pr_content
+            && matches!(
+                app.pr_tab,
+                PrTab::Thread | PrTab::Diff | PrTab::Reviews
+            );
+        let header_h = if hide_header { 0u16 } else { 4u16 };
+        let v = if hide_header {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0)])
+                .split(main)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(header_h), Constraint::Min(0)])
+                .split(main)
+        };
 
-        let hb = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT));
-        let hi = hb.inner(v[0]);
-        f.render_widget(hb, v[0]);
-        f.render_widget(Paragraph::new(head), hi);
-        f.render_widget(
-            Paragraph::new(Span::styled(meta, Style::default().fg(SUB))).wrap(Wrap { trim: true }),
-            Rect {
-                x: hi.x,
-                y: hi.y + 1,
-                width: hi.width,
-                height: hi.height.saturating_sub(1),
-            },
-        );
+        if !hide_header {
+            let hb = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT));
+            let hi = hb.inner(v[0]);
+            f.render_widget(hb, v[0]);
+            f.render_widget(Paragraph::new(head), hi);
+            f.render_widget(
+                Paragraph::new(Span::styled(meta, Style::default().fg(SUB)))
+                    .wrap(Wrap { trim: true }),
+                Rect {
+                    x: hi.x,
+                    y: hi.y + 1,
+                    width: hi.width,
+                    height: hi.height.saturating_sub(1),
+                },
+            );
+        }
 
+        let body_i = if hide_header { 0 } else { 1 };
         match app.pr_tab {
-            PrTab::Info => draw_tab_info(f, app, &pr, v[1]),
-            PrTab::Thread => draw_tab_thread(f, app, v[1]),
-            PrTab::Commits => draw_tab_commits(f, app, v[1]),
-            PrTab::Files => draw_tab_files(f, app, v[1]),
-            PrTab::Diff => draw_tab_diff(f, app, v[1]),
-            PrTab::Reviews => draw_tab_reviews(f, app, v[1]),
+            PrTab::Info => draw_tab_info(f, app, &pr, v[body_i]),
+            PrTab::Thread => draw_tab_thread(f, app, v[body_i]),
+            PrTab::Commits => draw_tab_commits(f, app, v[body_i]),
+            PrTab::Files => draw_tab_files(f, app, v[body_i]),
+            PrTab::Diff => draw_tab_diff(f, app, v[body_i]),
+            PrTab::Reviews => draw_tab_reviews(f, app, v[body_i]),
         }
     } else {
         f.render_widget(
@@ -626,11 +644,11 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .constraints([Constraint::Min(4), Constraint::Length(2)])
         .split(area);
     let items: Vec<ListItem> = app
-        .reviews_lines
+        .reviews_cached
         .iter()
-        .map(|s| {
+        .map(|r| {
             ListItem::new(Span::styled(
-                s.as_str(),
+                r.summary.as_str(),
                 Style::default().fg(SUB),
             ))
         })
@@ -641,7 +659,7 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MAUVE))
                 .title(Line::from(Span::styled(
-                    " submitted reviews  j/k  ·  a split-pane composer ",
+                    " reviews  j/k · Enter full text · a composer ",
                     Style::default().fg(MAUVE),
                 ))),
         )
@@ -651,19 +669,19 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .fg(TEXT)
                 .add_modifier(Modifier::BOLD),
         );
-    if app.reviews_lines.is_empty() {
+    if app.reviews_cached.is_empty() {
         app.review_list_state.select(None);
     } else {
         let i = app
             .review_cursor
-            .min(app.reviews_lines.len().saturating_sub(1));
+            .min(app.reviews_cached.len().saturating_sub(1));
         app.review_list_state.select(Some(i));
     }
     f.render_stateful_widget(list, chunks[0], &mut app.review_list_state);
     let hint = Paragraph::new(Line::from(vec![
         Span::styled(" a ", Style::default().fg(GREEN).bold()),
         Span::styled(
-            "opens a 3-pane TUI here (Files | Diff | Finish) — same tab, no popup.  ",
+            "composer · Enter on row = read whole review · z/Z widen layout (see ? on tab)  ",
             Style::default().fg(SUB),
         ),
         Span::styled("Esc", Style::default().fg(ACCENT)),
@@ -1187,27 +1205,136 @@ fn pane_strip_line(focus: ReviewsComposePane) -> Line<'static> {
     ])
 }
 
+fn help_title(ctx: HelpContext) -> &'static str {
+    match ctx {
+        HelpContext::PrList => "PR list",
+        HelpContext::PrDetailInfo => "PR · Info",
+        HelpContext::PrDetailThread => "PR · Thread",
+        HelpContext::PrDetailCommits => "PR · Commits",
+        HelpContext::PrDetailFiles => "PR · Files",
+        HelpContext::PrDetailDiff => "PR · Diff",
+        HelpContext::PrDetailReviews => "PR · Reviews",
+        HelpContext::PrDetailReviewsComposer => "PR · Review composer",
+    }
+}
+
+fn help_for_context(ctx: HelpContext) -> &'static str {
+    match ctx {
+        HelpContext::PrList => "\
+PR LIST\n\
+  j k Enter     move / open PR       Mouse   pick row\n\
+  f A           filters / status      a       cycle list status\n\
+  m r n         more / refresh / new PR wizard    o  browser\n\
+  : cmd         :help :filter :create …    q quit\n",
+        HelpContext::PrDetailInfo => "\
+INFO TAB\n\
+  q             back to list          1-6     other tabs\n\
+  j k g G       scroll description    Ctrl+d/u page\n\
+  E             open title+body in $EDITOR\n\
+  z Z           hide tab rail / maximize content height\n\
+  ?             this help\n",
+        HelpContext::PrDetailThread => "\
+THREAD TAB\n\
+  j k           select comment        c R e d  comment reply edit delete\n\
+  [ ]           scroll diff hunk      + L      reactions\n\
+  E             open in $EDITOR       I        Kitty icat (image in body)\n\
+  Ctrl+d u      scroll body           g G      top/bottom\n\
+  z Z           layout (wider / taller)\n",
+        HelpContext::PrDetailCommits => "\
+COMMITS TAB\n\
+  j k           commits list          E        export in $EDITOR\n\
+  Ctrl+d u g G  scroll                z Z      layout\n",
+        HelpContext::PrDetailFiles => "\
+FILES TAB\n\
+  j k           files                 E        export list\n\
+  Ctrl+d u g G  scroll                z Z      layout\n",
+        HelpContext::PrDetailDiff => "\
+DIFF TAB\n\
+  Ctrl+d u g G  scroll patch          E        whole .diff in $EDITOR\n\
+  z Z           layout                V        Neovim bundle (GH_PR_CLI_NVIM)\n",
+        HelpContext::PrDetailReviews => "\
+REVIEWS TAB (submitted)\n\
+  j k Enter     list / open full review overlay (q Esc close)\n\
+  a             start pending-review composer (Files|Diff|Finish)\n\
+  z Z           layout\n\
+\n\
+GLOBAL IN PR\n\
+  q list  r reload  o PR in browser  : cmd  ? help\n",
+        HelpContext::PrDetailReviewsComposer => "\
+REVIEW COMPOSER (pending review on GitHub)\n\
+  Tab Shift+Tab   Files → Diff → Finish     Esc  exit composer\n\
+  FILES   j k Enter   pick file, load diff into Diff\n\
+  DIFF    j k n p     move / jump commentable lines\n\
+          [ ]         start/end line for multi-line comment (same side)\n\
+          r           clear [ ] range\n\
+          Enter       open Write box under diff\n\
+  WRITE   Ctrl+Enter / Alt+Enter / Ctrl+s / F2   post comment to pending review\n\
+          Ctrl+e      $EDITOR (keeps multi-line range)\n\
+          Esc         close draft only\n\
+  FINISH  j k Enter   Approve | Request changes | Comment | Discard\n\
+  Mouse   click panes (when no draft open)\n",
+    }
+}
+
 fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
     match &mut app.overlay {
         Overlay::None => {}
-        Overlay::Help => {
+        Overlay::Help(ctx) => {
             let w = (full.width * 4 / 5).max(40);
             let h = (full.height * 4 / 5).max(20);
             let x = (full.width.saturating_sub(w)) / 2;
             let y = (full.height.saturating_sub(h)) / 2;
             let area = Rect { x, y, width: w, height: h };
             f.render_widget(Clear, area);
-            let help = HELP_TEXT;
+            let help = help_for_context(*ctx);
+            let title = help_title(*ctx);
             let p = Paragraph::new(help)
                 .wrap(Wrap { trim: true })
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(ACCENT))
-                        .title(Line::from(Span::styled(
-                            " help (q Esc ? close) ",
-                            Style::default().fg(ACCENT).bold(),
-                        )))
+                        .title(Line::from(vec![
+                            Span::styled(" help ", Style::default().fg(ACCENT).bold()),
+                            Span::styled(title, Style::default().fg(SUB)),
+                            Span::styled("  q Esc ? close ", Style::default().fg(SUB)),
+                        ]))
+                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                );
+            f.render_widget(p, area);
+        }
+        Overlay::ReviewDetail {
+            title,
+            body,
+            url,
+            scroll,
+        } => {
+            let w = (full.width * 5 / 6).max(45);
+            let h = (full.height * 5 / 6).max(18);
+            let x = (full.width.saturating_sub(w)) / 2;
+            let y = (full.height.saturating_sub(h)) / 2;
+            let area = Rect { x, y, width: w, height: h };
+            f.render_widget(Clear, area);
+            let p = Paragraph::new(body.as_str())
+                .wrap(Wrap { trim: true })
+                .scroll((*scroll as u16, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(MAUVE))
+                        .title(Line::from(vec![
+                            Span::styled(
+                                format!(" {title} "),
+                                Style::default().fg(MAUVE).bold(),
+                            ),
+                            Span::styled(
+                                format!(
+                                    "  {}  ·  j/k · Ctrl+d/u · o · q ",
+                                    PrListEntry::ellipsize(url.as_str(), 36)
+                                ),
+                                Style::default().fg(SUB),
+                            ),
+                        ]))
                         .style(Style::default().bg(SURFACE).fg(TEXT)),
                 );
             f.render_widget(p, area);
@@ -1367,54 +1494,3 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
     }
 }
 
-const HELP_TEXT: &str = "\
-gh-pr-cli — quick reference\n\
-═══════════════════════════════════════════════════════════════════\n\
-\n\
-AUTH\n\
-  gh auth login     (preferred)    or    env GITHUB_TOKEN\n\
-\n\
-PR LIST\n\
-  j k Enter     move / open PR          Mouse click   select row\n\
-  f             filters (s = status)    A             status menu only\n\
-  a             cycle status            m r           more / refresh page 1\n\
-  n             new PR wizard           o             browser\n\
-  : :create :pr same wizard — head = current git branch, base = origin default or main\n\
-\n\
-PR DETAIL (tabs 1-6)\n\
-  q             back to list\n\
-  E             OPEN CURRENT TAB IN $VISUAL / $EDITOR\n\
-                  - Diff tab: full patch (.diff), fetched first if empty\n\
-                  - Thread: selected comment text + diff hunk\n\
-                  - Info / Reviews / Commits / Files: that tab’s buffer\n\
-  V             Neovim: threaded comments + full diff (binary: GH_PR_CLI_NVIM)\n\
-  Ctrl+d u      scroll the focused pane (Info, Thread body, Diff, …)\n\
-\n\
-THREAD (tab 2) — review with code context\n\
-  j k           pick comment (list scrolls with selection)\n\
-  Center area   left/top = diff at comment, right/bottom = markdown + reactions\n\
-  [  ]          scroll the code / diff-hunk pane\n\
-  c R e d       new comment / reply / edit / delete\n\
-  + L           reaction picker / load counts (cached after L)\n\
-  I             Kitty: kitten icat for first image URL in body\n\
-  g g  G        scroll comment body top / bottom\n\
-\n\
-REVIEWS (tab 6)\n\
-  j k           browse submitted reviews (when composer is closed)\n\
-  a             open split-pane composer (Files | Diff | Finish), like “Start a review”\n\
-                Tab / Shift+Tab   panes · Esc closes composer (pending review stays on GitHub)\n\
-                Diff: GitHub-style file view — old│new│+/- gutters; n/p jump commentable lines\n\
-                Enter         docked “Write” box under the diff (Markdown; Ctrl+Enter posts comment)\n\
-                Ctrl+e        open $EDITOR for long comments · Esc closes draft only\n\
-                Finish pane: Approve | Request changes | Comment | Discard (y confirm)\n\
-                Mouse selects pane/row when no draft is open\n\
-\n\
-FILTERS  (:command from any screen, refreshes list)\n\
-  :filter clear | show    :state open|closed|merged|draft|all\n\
-  :author :assignee :mentions :reviewer :reviewed :label :title :head :base\n\
-  Each :field clear   Branch-only uses REST; other fields use GitHub search.\n\
-\n\
-STARTUP\n\
-  --status STATE              GH_PR_CLI_STATUS  GH_PR_CLI_TITLE  …  (see :filter show)\n\
-\n\
-";

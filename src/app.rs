@@ -291,6 +291,30 @@ pub enum FilterPanelPhase {
     StatusPick { cursor: usize },
 }
 
+/// Context-sensitive `?` help (per screen / tab / composer).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HelpContext {
+    PrList,
+    PrDetailInfo,
+    PrDetailThread,
+    PrDetailCommits,
+    PrDetailFiles,
+    PrDetailDiff,
+    PrDetailReviews,
+    PrDetailReviewsComposer,
+}
+
+/// One row in the Reviews tab (submitted reviews list).
+#[derive(Clone)]
+pub struct CachedReview {
+    pub id: u64,
+    pub who: String,
+    pub state: String,
+    pub summary: String,
+    pub body: String,
+    pub html_url: String,
+}
+
 /// Focused pane in the Reviews tab **composer** (split layout, not a popup).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ReviewsComposePane {
@@ -309,8 +333,12 @@ pub enum ReviewsComposerSubphase {
 #[derive(Clone, Debug)]
 pub struct InlineCommentDraft {
     pub path: String,
+    /// End line for GitHub `line` (inclusive).
     pub line: u32,
     pub side: String,
+    /// Multi-line: GitHub `start_line` (inclusive); omit for single-line comments.
+    pub start_line: Option<u32>,
+    pub start_side: Option<String>,
     pub chars: Vec<char>,
     pub cursor: usize,
 }
@@ -331,6 +359,34 @@ pub struct ReviewsComposer {
     pub submit_cursor: usize,
     /// When set, keyboard focuses this composer (Esc / Ctrl+Enter); diff list is read-only until closed.
     pub comment_draft: Option<InlineCommentDraft>,
+    /// `[` / `]` on a commentable row: multi-line review comment (same side).
+    pub range_start: Option<(u32, String)>,
+    pub range_end: Option<(u32, String)>,
+}
+
+impl ReviewsComposer {
+    /// `(end_line, side, start_line?, start_side?)` for GitHub inline comment API.
+    fn inline_comment_target(&self) -> Result<(u32, String, Option<u32>, Option<String>), &'static str> {
+        if let (Some((a, sa)), Some((b, sb))) = (&self.range_start, &self.range_end) {
+            if sa != sb {
+                return Err("range: [ and ] must be on the same side (LEFT/RIGHT)");
+            }
+            let lo = (*a).min(*b);
+            let hi = (*a).max(*b);
+            let side = sa.clone();
+            if lo < hi {
+                return Ok((hi, side.clone(), Some(lo), Some(side)));
+            }
+            return Ok((hi, side, None, None));
+        }
+        let Some(dl) = self.diff_lines.get(self.line_cursor) else {
+            return Err("no diff");
+        };
+        let Some((l, s)) = dl.anchor else {
+            return Err("not a commentable line");
+        };
+        Ok((l, s.to_string(), None, None))
+    }
 }
 
 pub(crate) fn pr_status_menu_cursor(st: github::PrStatusFilter) -> usize {
@@ -346,7 +402,14 @@ pub(crate) fn pr_status_menu_cursor(st: github::PrStatusFilter) -> usize {
 #[derive(Clone)]
 pub enum Overlay {
     None,
-    Help,
+    Help(HelpContext),
+    /// Full submitted review body (Reviews tab · Enter on a row).
+    ReviewDetail {
+        title: String,
+        body: String,
+        url: String,
+        scroll: usize,
+    },
     Command,
     ReactionPicker,
     CreatePrWizard {
@@ -377,6 +440,8 @@ pub enum EditorIntent {
         path: String,
         line: u32,
         side: String,
+        start_line: Option<u32>,
+        start_side: Option<String>,
     },
     /// Finalize a pending review (`SubmitPick` after choosing action).
     SubmitPullReview {
@@ -449,9 +514,13 @@ pub struct App {
     pub file_scroll: usize,
     pub diff_text: String,
     pub diff_scroll: usize,
-    pub reviews_lines: Vec<String>,
+    pub reviews_cached: Vec<CachedReview>,
     pub review_cursor: usize,
     pub review_scroll: usize,
+    /// `z` — hide tab rail for more horizontal space.
+    pub hide_tab_rail: bool,
+    /// `Z` — hide PR title strip on Thread / Diff / Reviews for taller content.
+    pub maximize_pr_content: bool,
     /// Stateful list scroll for Thread and Reviews panes.
     pub thread_list_state: ListState,
     pub review_list_state: ListState,
@@ -460,6 +529,8 @@ pub struct App {
     pub inline_review_submit_state: ListState,
     /// Reviews tab: split-pane composer (`a`), None = browse submitted reviews list.
     pub reviews_composer: Option<ReviewsComposer>,
+    /// Reviews tab (no composer): `D` then `y` to delete your pending review on GitHub.
+    pub reviews_remote_discard_confirm: bool,
     pub compose_hit_files: Cell<Option<Rect>>,
     pub compose_hit_diff: Cell<Option<Rect>>,
     pub compose_hit_actions: Cell<Option<Rect>>,
@@ -518,9 +589,11 @@ impl App {
             file_scroll: 0,
             diff_text: String::new(),
             diff_scroll: 0,
-            reviews_lines: Vec::new(),
+            reviews_cached: Vec::new(),
             review_cursor: 0,
             review_scroll: 0,
+            hide_tab_rail: false,
+            maximize_pr_content: false,
             thread_list_state: ListState::default(),
             review_list_state: ListState::default(),
             inline_review_file_state: ListState::default(),
@@ -542,6 +615,27 @@ impl App {
             s.pr_status = st;
         }
         s
+    }
+
+    /// Which help text to show for `?` / `:help` (per screen and tab).
+    pub fn help_context(&self) -> HelpContext {
+        match self.screen {
+            Screen::PrList => HelpContext::PrList,
+            Screen::PrDetail => {
+                if self.reviews_composer.is_some() {
+                    HelpContext::PrDetailReviewsComposer
+                } else {
+                    match self.pr_tab {
+                        PrTab::Info => HelpContext::PrDetailInfo,
+                        PrTab::Thread => HelpContext::PrDetailThread,
+                        PrTab::Commits => HelpContext::PrDetailCommits,
+                        PrTab::Files => HelpContext::PrDetailFiles,
+                        PrTab::Diff => HelpContext::PrDetailDiff,
+                        PrTab::Reviews => HelpContext::PrDetailReviews,
+                    }
+                }
+            }
+        }
     }
 
     /// `GH_PR_CLI_STATUS`, `GH_PR_CLI_TITLE`, `GH_PR_CLI_AUTHOR`, `GH_PR_CLI_LABEL`, etc.
@@ -882,8 +976,10 @@ impl App {
         self.file_cursor = 0;
         self.diff_text.clear();
         self.diff_scroll = 0;
-        self.reviews_lines.clear();
+        self.reviews_cached.clear();
         self.review_cursor = 0;
+        self.hide_tab_rail = false;
+        self.maximize_pr_content = false;
         self.thread_list_state = ListState::default();
         self.review_list_state = ListState::default();
         self.reviews_composer = None;
@@ -1068,23 +1164,35 @@ impl App {
         self.loading = false;
         match r {
             Ok(rs) => {
-                self.reviews_lines = rs
+                self.reviews_cached = rs
                     .into_iter()
                     .map(|rev| {
                         let who = rev
                             .user
                             .as_ref()
                             .map(|u| u.login.as_str())
-                            .unwrap_or("?");
+                            .unwrap_or("?")
+                            .to_string();
                         let st = rev
                             .state
                             .map(|s| format!("{s:?}"))
                             .unwrap_or_else(|| "?".into());
                         let body = rev.body.unwrap_or_default();
-                        format!("{who}  [{st}]  {}", body.lines().next().unwrap_or(""))
+                        let summary = format!(
+                            "{who}  [{st}]  {}",
+                            body.lines().next().unwrap_or("")
+                        );
+                        CachedReview {
+                            id: rev.id.0,
+                            who,
+                            state: st,
+                            summary,
+                            body,
+                            html_url: rev.html_url.to_string(),
+                        }
                     })
                     .collect();
-                self.set_status(format!("{} reviews", self.reviews_lines.len()));
+                self.set_status(format!("{} reviews", self.reviews_cached.len()));
             }
             Err(e) => self.set_status(format!("reviews: {e:#}")),
         }
@@ -1098,7 +1206,7 @@ impl App {
             PrTab::Commits if self.commits.is_empty() => self.load_commits(rt)?,
             PrTab::Files if self.files_lines.is_empty() => self.load_files(rt)?,
             PrTab::Diff if self.diff_text.is_empty() => self.load_diff(rt)?,
-            PrTab::Reviews if self.reviews_lines.is_empty() => self.load_reviews(rt)?,
+            PrTab::Reviews if self.reviews_cached.is_empty() => self.load_reviews(rt)?,
             _ => {}
         }
         Ok(())
@@ -1229,6 +1337,8 @@ impl App {
                 path,
                 line,
                 side,
+                start_line,
+                start_side,
             } => {
                 let _ = self.finish_pending_inline_comment(
                     rt,
@@ -1239,6 +1349,8 @@ impl App {
                     line,
                     &side,
                     &body,
+                    start_line,
+                    start_side.as_deref(),
                 );
             }
             EditorIntent::SubmitPullReview { review_id, action } => {
@@ -1289,10 +1401,43 @@ impl App {
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent, rt: &Runtime) -> anyhow::Result<AppEffect> {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+            && matches!(&self.overlay, Overlay::ReviewDetail { .. })
+        {
+            self.overlay = Overlay::None;
+            return Ok(AppEffect::None);
+        }
+
         match &mut self.overlay {
-            Overlay::Help => {
+            Overlay::Help(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
                     self.overlay = Overlay::None;
+                }
+                Ok(AppEffect::None)
+            }
+            Overlay::ReviewDetail {
+                scroll,
+                url,
+                ..
+            } => {
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *scroll = scroll.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *scroll = scroll.saturating_sub(1);
+                    }
+                    KeyCode::Char('o') if !url.is_empty() => {
+                        let _ = open::that(url.as_str());
+                    }
+                    _ => {}
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('d') => *scroll = scroll.saturating_add(8),
+                        KeyCode::Char('u') => *scroll = scroll.saturating_sub(8),
+                        _ => {}
+                    }
                 }
                 Ok(AppEffect::None)
             }
@@ -1648,7 +1793,7 @@ impl App {
                 };
             }
             "help" => {
-                self.overlay = Overlay::Help;
+                self.overlay = Overlay::Help(self.help_context());
             }
             "more" if self.screen == Screen::PrList => {
                 let _ = self.load_more_prs(rt);
@@ -1698,7 +1843,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return Ok(AppEffect::Quit),
             KeyCode::Char('?') => {
-                self.overlay = Overlay::Help;
+                self.overlay = Overlay::Help(self.help_context());
             }
             KeyCode::Char(':') => {
                 self.overlay = Overlay::Command;
@@ -1784,11 +1929,16 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('d') => self.page_down_current(),
-                KeyCode::Char('u') => self.page_up_current(),
+                KeyCode::Char('d') => {
+                    self.page_down_current();
+                    return Ok(AppEffect::None);
+                }
+                KeyCode::Char('u') => {
+                    self.page_up_current();
+                    return Ok(AppEffect::None);
+                }
                 _ => {}
             }
-            return Ok(AppEffect::None);
         }
 
         if self.pr_tab == PrTab::Reviews && self.reviews_composer.is_some() {
@@ -1815,7 +1965,7 @@ impl App {
                 ));
             }
             KeyCode::Char('?') => {
-                self.overlay = Overlay::Help;
+                self.overlay = Overlay::Help(self.help_context());
             }
             KeyCode::Char(':') => {
                 self.overlay = Overlay::Command;
@@ -1986,6 +2136,34 @@ impl App {
                         let _ = open::that(u.as_str());
                     }
                 }
+            }
+            KeyCode::Enter => {
+                if self.pr_tab == PrTab::Reviews && self.reviews_composer.is_none() {
+                    if let Some(r) = self.reviews_cached.get(self.review_cursor).cloned() {
+                        self.overlay = Overlay::ReviewDetail {
+                            title: format!("{} · [{}] · review #{}", r.who, r.state, r.id),
+                            body: r.body,
+                            url: r.html_url,
+                            scroll: 0,
+                        };
+                    }
+                }
+            }
+            KeyCode::Char('z') => {
+                self.hide_tab_rail = !self.hide_tab_rail;
+                self.set_status(if self.hide_tab_rail {
+                    "z: tab rail hidden (more width) — z again to show"
+                } else {
+                    "z: tab rail visible"
+                });
+            }
+            KeyCode::Char('Z') => {
+                self.maximize_pr_content = !self.maximize_pr_content;
+                self.set_status(if self.maximize_pr_content {
+                    "Z: taller Thread/Diff/Reviews body — Z again to restore title strip"
+                } else {
+                    "Z: normal PR header"
+                });
             }
             KeyCode::Char(c) if matches!(c, '1'..='6') => {
                 if let Some(d) = c.to_digit(10) {
@@ -2166,29 +2344,73 @@ impl App {
                     }
                     Ok(Some(AppEffect::None))
                 }
+                KeyCode::Char('[') => {
+                    if comp.path.is_empty() {
+                        self.set_status("load a file diff first");
+                        return Ok(Some(AppEffect::None));
+                    }
+                    if let Some(dl) = comp.diff_lines.get(comp.line_cursor) {
+                        if let Some((ln, side)) = dl.anchor {
+                            comp.range_start = Some((ln, side.to_string()));
+                            self.set_status(format!(
+                                "range start: L{ln} ({side}) — move to end row, press ]"
+                            ));
+                            return Ok(Some(AppEffect::None));
+                        }
+                    }
+                    self.set_status("[ on a commentable line (n/p) — start of multi-line comment");
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char(']') => {
+                    if comp.path.is_empty() {
+                        self.set_status("load a file diff first");
+                        return Ok(Some(AppEffect::None));
+                    }
+                    if let Some(dl) = comp.diff_lines.get(comp.line_cursor) {
+                        if let Some((ln, side)) = dl.anchor {
+                            comp.range_end = Some((ln, side.to_string()));
+                            self.set_status(format!(
+                                "range end: L{ln} ({side}) — Enter opens write box (same side as [ )"
+                            ));
+                            return Ok(Some(AppEffect::None));
+                        }
+                    }
+                    self.set_status("] on a commentable line — end of multi-line range");
+                    Ok(Some(AppEffect::None))
+                }
+                KeyCode::Char('r') => {
+                    comp.range_start = None;
+                    comp.range_end = None;
+                    self.set_status("cleared [ ] multi-line range");
+                    Ok(Some(AppEffect::None))
+                }
                 KeyCode::Enter => {
                     if comp.path.is_empty() {
                         self.set_status("Files pane: Enter loads a diff into this pane");
                         return Ok(Some(AppEffect::None));
                     }
-                    if let Some(dl) = comp.diff_lines.get(comp.line_cursor) {
-                        if let Some((line, side)) = dl.anchor {
+                    match comp.inline_comment_target() {
+                        Err(msg) => {
+                            self.set_status(msg.to_string());
+                            Ok(Some(AppEffect::None))
+                        }
+                        Ok((line, side, start_line, start_side)) => {
                             let path = comp.path.clone();
                             comp.comment_draft = Some(InlineCommentDraft {
                                 path,
                                 line,
-                                side: side.to_string(),
+                                side: side.clone(),
+                                start_line,
+                                start_side,
                                 chars: Vec::new(),
                                 cursor: 0,
                             });
                             self.set_status(
-                                "Write below (like GitHub) · Ctrl+Enter post · Esc cancel · Ctrl+e $EDITOR",
+                                "Write · Ctrl+Enter / Alt+Enter / Ctrl+s / F2 post · Esc · Ctrl+e editor",
                             );
-                            return Ok(Some(AppEffect::None));
+                            Ok(Some(AppEffect::None))
                         }
                     }
-                    self.set_status("Pick a line with a + affordance (n/p jump commentable rows)");
-                    Ok(Some(AppEffect::None))
                 }
                 KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let Some(n) = self.pr_number else {
@@ -2201,13 +2423,25 @@ impl App {
                     let pend = comp.pending_review_id;
                     let sha = comp.commit_sha.clone();
                     let path = comp.path.clone();
-                    if let Some(dl) = comp.diff_lines.get(comp.line_cursor) {
-                        if let Some((line, side)) = dl.anchor {
-                            let initial = format!(
-                                "## `{path}` line {line} ({side})\n\n\
+                    match comp.inline_comment_target() {
+                        Err(msg) => {
+                            self.set_status(msg.to_string());
+                            Ok(Some(AppEffect::None))
+                        }
+                        Ok((line, side, start_line, start_side)) => {
+                            let initial = if let Some(lo) = start_line {
+                                format!(
+                                    "## `{path}` multi-line L{lo}–L{line} ({side})\n\n\
 Comment (markdown). Optional suggestion:\n\n\
 ```suggestion\n\n```\n",
-                            );
+                                )
+                            } else {
+                                format!(
+                                    "## `{path}` line {line} ({side})\n\n\
+Comment (markdown). Optional suggestion:\n\n\
+```suggestion\n\n```\n",
+                                )
+                            };
                             return Ok(Some(AppEffect::OpenEditor {
                                 initial,
                                 intent: EditorIntent::InlineReviewComment {
@@ -2216,13 +2450,13 @@ Comment (markdown). Optional suggestion:\n\n\
                                     commit_sha: sha,
                                     path,
                                     line,
-                                    side: side.to_string(),
+                                    side,
+                                    start_line,
+                                    start_side,
                                 },
                             }));
                         }
                     }
-                    self.set_status("Move to a commentable line first (n/p)");
-                    Ok(Some(AppEffect::None))
                 }
                 _ => Ok(None),
             },
@@ -2346,6 +2580,8 @@ Comment (markdown). Optional suggestion:\n\n\
             session_comments: Vec::new(),
             submit_cursor: 0,
             comment_draft: None,
+            range_start: None,
+            range_end: None,
         });
         self.pr_tab = PrTab::Reviews;
         self.set_status(format!(
@@ -2461,9 +2697,9 @@ Comment (markdown). Optional suggestion:\n\n\
                 }
             }
             PrTab::Reviews => {
-                if !self.reviews_lines.is_empty() {
+                if !self.reviews_cached.is_empty() {
                     self.review_cursor =
-                        (self.review_cursor + 1).min(self.reviews_lines.len() - 1);
+                        (self.review_cursor + 1).min(self.reviews_cached.len() - 1);
                 }
             }
             _ => {}
@@ -2600,8 +2836,14 @@ Comment (markdown). Optional suggestion:\n\n\
                 .selected_thread_item()
                 .map(|it| (Self::thread_detail_plain(it), ".md")),
             PrTab::Diff => (!self.diff_text.is_empty()).then_some((self.diff_text.clone(), ".diff")),
-            PrTab::Reviews => (!self.reviews_lines.is_empty())
-                .then_some((self.reviews_lines.join("\n"), ".txt")),
+            PrTab::Reviews => (!self.reviews_cached.is_empty()).then_some((
+                self.reviews_cached
+                    .iter()
+                    .map(|r| r.summary.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                ".txt",
+            )),
             PrTab::Commits => self.commits.get(self.commit_cursor).map(|c| {
                 (
                     format!("{}\n\n{}", c.sha, c.commit.message),
@@ -2645,6 +2887,8 @@ Comment (markdown). Optional suggestion:\n\n\
         line: u32,
         side: &str,
         body: &str,
+        start_line: Option<u32>,
+        start_side: Option<&str>,
     ) -> anyhow::Result<()> {
         let r = rt.block_on(github::create_pull_review_inline_comment(
             &self.octo,
@@ -2656,14 +2900,22 @@ Comment (markdown). Optional suggestion:\n\n\
             line,
             side,
             body,
-            Some(pending_review_id),
+            start_line,
+            start_side,
         ));
         match r {
             Ok(_) => {
                 let peek = PrListEntry::ellipsize(body.lines().next().unwrap_or("(empty)"), 72);
-                let summary = format!("`{path}` L{line}: {peek}");
+                let loc = if let Some(sl) = start_line {
+                    format!("`{path}` L{sl}–L{line}")
+                } else {
+                    format!("`{path}` L{line}")
+                };
+                let summary = format!("{loc}: {peek}");
                 if let Some(comp) = &mut self.reviews_composer {
                     comp.session_comments.push(summary);
+                    comp.range_start = None;
+                    comp.range_end = None;
                 }
                 self.set_status(format!(
                     "added to pending review #{pending_review_id} — pick another line or ▸ Finish"
@@ -2706,8 +2958,8 @@ Comment (markdown). Optional suggestion:\n\n\
                 self.set_status("comment draft closed");
                 Ok(Some(AppEffect::None))
             }
-            KeyCode::Enter if ctrl => {
-                let (body, path, line, side, pend, sha) = {
+            KeyCode::Enter if ctrl || alt => {
+                let (body, path, line, side, sl, ss, pend, sha) = {
                     let c = self.reviews_composer.as_mut().unwrap();
                     let d = c.comment_draft.as_ref().unwrap();
                     (
@@ -2715,6 +2967,8 @@ Comment (markdown). Optional suggestion:\n\n\
                         d.path.clone(),
                         d.line,
                         d.side.clone(),
+                        d.start_line,
+                        d.start_side.clone(),
                         c.pending_review_id,
                         c.commit_sha.clone(),
                     )
@@ -2729,7 +2983,105 @@ Comment (markdown). Optional suggestion:\n\n\
                 };
                 let ok = self
                     .finish_pending_inline_comment(
-                        rt, pr, pend, &sha, &path, line, &side, trimmed,
+                        rt,
+                        pr,
+                        pend,
+                        &sha,
+                        &path,
+                        line,
+                        &side,
+                        trimmed,
+                        sl,
+                        ss.as_deref(),
+                    )
+                    .is_ok();
+                if ok {
+                    if let Some(c) = self.reviews_composer.as_mut() {
+                        c.comment_draft = None;
+                    }
+                }
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::Char('s') if ctrl => {
+                // Same terminals swallow Ctrl+Enter; Ctrl+S also submits.
+                let (body, path, line, side, sl, ss, pend, sha) = {
+                    let c = self.reviews_composer.as_mut().unwrap();
+                    let d = c.comment_draft.as_ref().unwrap();
+                    (
+                        d.chars.iter().collect::<String>(),
+                        d.path.clone(),
+                        d.line,
+                        d.side.clone(),
+                        d.start_line,
+                        d.start_side.clone(),
+                        c.pending_review_id,
+                        c.commit_sha.clone(),
+                    )
+                };
+                let trimmed = body.trim();
+                if trimmed.is_empty() {
+                    self.set_status("empty comment — add text or Esc");
+                    return Ok(Some(AppEffect::None));
+                }
+                let Some(pr) = pr_n else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let ok = self
+                    .finish_pending_inline_comment(
+                        rt,
+                        pr,
+                        pend,
+                        &sha,
+                        &path,
+                        line,
+                        &side,
+                        trimmed,
+                        sl,
+                        ss.as_deref(),
+                    )
+                    .is_ok();
+                if ok {
+                    if let Some(c) = self.reviews_composer.as_mut() {
+                        c.comment_draft = None;
+                    }
+                }
+                Ok(Some(AppEffect::None))
+            }
+            KeyCode::F(2) => {
+                let (body, path, line, side, sl, ss, pend, sha) = {
+                    let c = self.reviews_composer.as_mut().unwrap();
+                    let d = c.comment_draft.as_ref().unwrap();
+                    (
+                        d.chars.iter().collect::<String>(),
+                        d.path.clone(),
+                        d.line,
+                        d.side.clone(),
+                        d.start_line,
+                        d.start_side.clone(),
+                        c.pending_review_id,
+                        c.commit_sha.clone(),
+                    )
+                };
+                let trimmed = body.trim();
+                if trimmed.is_empty() {
+                    self.set_status("empty comment — add text or Esc");
+                    return Ok(Some(AppEffect::None));
+                }
+                let Some(pr) = pr_n else {
+                    return Ok(Some(AppEffect::None));
+                };
+                let ok = self
+                    .finish_pending_inline_comment(
+                        rt,
+                        pr,
+                        pend,
+                        &sha,
+                        &path,
+                        line,
+                        &side,
+                        trimmed,
+                        sl,
+                        ss.as_deref(),
                     )
                     .is_ok();
                 if ok {
@@ -2753,15 +3105,19 @@ Comment (markdown). Optional suggestion:\n\n\
                 let path = taken.path;
                 let line = taken.line;
                 let side = taken.side;
+                let start_line = taken.start_line;
+                let start_side = taken.start_side;
                 let (pend, sha) = {
                     let c = self.reviews_composer.as_ref().unwrap();
                     (c.pending_review_id, c.commit_sha.clone())
                 };
                 let initial: String = taken.chars.iter().collect();
-                let initial = if initial.trim().is_empty() {
-                    format!("## `{path}` line {line} ({side})\n\n")
-                } else {
+                let initial = if !initial.trim().is_empty() {
                     initial
+                } else if let Some(lo) = start_line {
+                    format!("## `{path}` multi-line L{lo}–L{line} ({side})\n\n")
+                } else {
+                    format!("## `{path}` line {line} ({side})\n\n")
                 };
                 Ok(Some(AppEffect::OpenEditor {
                     initial,
@@ -2772,6 +3128,8 @@ Comment (markdown). Optional suggestion:\n\n\
                         path,
                         line,
                         side,
+                        start_line,
+                        start_side,
                     },
                 }))
             }
