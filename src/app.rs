@@ -16,6 +16,7 @@ use octocrab::models::pulls::PullRequest;
 use octocrab::models::repos::RepoCommit;
 use octocrab::models::CommentId;
 use octocrab::models::reactions::ReactionContent;
+use octocrab::models::pulls::ReviewAction;
 use octocrab::params::pulls::MergeMethod;
 use octocrab::Octocrab;
 use ratatui::DefaultTerminal;
@@ -292,6 +293,10 @@ pub enum FilterPanelPhase {
 pub enum InlineReviewPhase {
     PickFile,
     PickLine,
+    /// Choose APPROVE / REQUEST_CHANGES / COMMENT then finish (or open `$EDITOR` for text actions).
+    SubmitPick,
+    /// `X` from PickLine — confirm discarding the pending review on GitHub.
+    ConfirmDiscard,
 }
 
 pub(crate) fn pr_status_menu_cursor(st: github::PrStatusFilter) -> usize {
@@ -319,13 +324,18 @@ pub enum Overlay {
     },
     /// PR filters + status (`f`; `s` opens status, `A` jumps to status).
     FilterSummary(FilterPanelPhase),
-    /// Reviews tab: pick file → diff line → `$EDITOR` → POST review comment.
+    /// Reviews tab: GitHub **pending review** — pick file → diff line → `$EDITOR` → attach comment;
+    /// `S` submit (approve / request changes / comment), `X` discard pending.
     InlineReview {
         phase: InlineReviewPhase,
         file_cursor: usize,
         path: String,
         diff_lines: Vec<diff_pick::DiffDisplayLine>,
         line_cursor: usize,
+        pending_review_id: u64,
+        commit_sha: String,
+        session_comments: Vec<String>,
+        submit_cursor: usize,
     },
 }
 
@@ -341,10 +351,16 @@ pub enum EditorIntent {
     },
     InlineReviewComment {
         pr: u64,
+        pending_review_id: u64,
         commit_sha: String,
         path: String,
         line: u32,
         side: String,
+    },
+    /// Finalize a pending review (`SubmitPick` after choosing action).
+    SubmitPullReview {
+        review_id: u64,
+        action: ReviewAction,
     },
 }
 
@@ -420,6 +436,7 @@ pub struct App {
     pub review_list_state: ListState,
     pub inline_review_file_state: ListState,
     pub inline_review_line_state: ListState,
+    pub inline_review_submit_state: ListState,
     /// Inner rect of the inline-review list (mouse row → index).
     pub wizard_hit_rect: Cell<Option<Rect>>,
     pub overlay: Overlay,
@@ -484,6 +501,7 @@ impl App {
             review_list_state: ListState::default(),
             inline_review_file_state: ListState::default(),
             inline_review_line_state: ListState::default(),
+            inline_review_submit_state: ListState::default(),
             wizard_hit_rect: Cell::new(None),
             overlay: Overlay::None,
             command_buf: String::new(),
@@ -1178,6 +1196,7 @@ impl App {
             }
             EditorIntent::InlineReviewComment {
                 pr,
+                pending_review_id,
                 commit_sha,
                 path,
                 line,
@@ -1193,15 +1212,56 @@ impl App {
                     line,
                     &side,
                     &body,
+                    Some(pending_review_id),
                 ));
                 match r {
                     Ok(_) => {
-                        self.set_status("posted inline review comment");
+                        let peek = PrListEntry::ellipsize(
+                            body.lines().next().unwrap_or("(empty)"),
+                            72,
+                        );
+                        let summary = format!("`{path}` L{line}: {peek}");
+                        if let Overlay::InlineReview {
+                            session_comments,
+                            ..
+                        } = &mut self.overlay
+                        {
+                            session_comments.push(summary);
+                        }
+                        self.set_status(format!(
+                            "added to pending review #{pending_review_id} — S submit · more comments · X discard"
+                        ));
+                        let _ = self.load_thread(rt);
+                    }
+                    Err(e) => self.set_status(format!("inline comment: {e:#}")),
+                }
+            }
+            EditorIntent::SubmitPullReview { review_id, action } => {
+                let Some(pr_n) = self.pr_number else {
+                    return Ok(());
+                };
+                let r = rt.block_on(github::submit_pull_review(
+                    &self.octo,
+                    &self.owner,
+                    &self.repo,
+                    pr_n,
+                    review_id,
+                    action,
+                    &body,
+                ));
+                match r {
+                    Ok(_) => {
+                        self.set_status(match action {
+                            ReviewAction::Approve => "Review submitted: APPROVED",
+                            ReviewAction::RequestChanges => "Review submitted: CHANGES_REQUESTED",
+                            ReviewAction::Comment => "Review submitted: COMMENT",
+                            _ => "Review submitted",
+                        });
                         self.overlay = Overlay::None;
                         let _ = self.load_thread(rt);
                         let _ = self.load_reviews(rt);
                     }
-                    Err(e) => self.set_status(format!("inline comment: {e:#}")),
+                    Err(e) => self.set_status(format!("submit review: {e:#}")),
                 }
             }
         }
@@ -1332,6 +1392,10 @@ impl App {
                 path,
                 diff_lines,
                 line_cursor,
+                pending_review_id,
+                commit_sha,
+                session_comments: _session_comments,
+                submit_cursor,
             } => match *phase {
                 InlineReviewPhase::PickFile => {
                     match key.code {
@@ -1375,7 +1439,7 @@ impl App {
                                                 self.inline_review_line_state =
                                                     ListState::default();
                                                 self.set_status(
-                                                    "line → Enter $EDITOR · n/p anchors · Esc file list · q quit",
+                                                    "Enter comment · S submit review · X discard pending · Esc file · q close",
                                                 );
                                             }
                                         }
@@ -1398,6 +1462,19 @@ impl App {
                     }
                     KeyCode::Char('q') => {
                         self.overlay = Overlay::None;
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('S') => {
+                        *phase = InlineReviewPhase::SubmitPick;
+                        *submit_cursor = 0;
+                        self.inline_review_submit_state = ListState::default();
+                        self.set_status(
+                            "finish review — j/k Enter · Approve is instant; others open $EDITOR",
+                        );
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('x') => {
+                        *phase = InlineReviewPhase::ConfirmDiscard;
                         Ok(AppEffect::None)
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
@@ -1428,9 +1505,6 @@ impl App {
                         let Some(n) = self.pr_number else {
                             return Ok(AppEffect::None);
                         };
-                        let Some(pr_obj) = self.current_pr.as_ref() else {
-                            return Ok(AppEffect::None);
-                        };
                         if let Some(dl) = diff_lines.get(*line_cursor) {
                             if let Some((line, side)) = dl.anchor {
                                 let initial = format!(
@@ -1445,7 +1519,8 @@ Comment (markdown). Optional suggestion block:\n\n\
                                     initial,
                                     intent: EditorIntent::InlineReviewComment {
                                         pr: n,
-                                        commit_sha: pr_obj.head.sha.clone(),
+                                        pending_review_id: *pending_review_id,
+                                        commit_sha: commit_sha.clone(),
                                         path: path.clone(),
                                         line,
                                         side: side.to_string(),
@@ -1454,6 +1529,94 @@ Comment (markdown). Optional suggestion block:\n\n\
                             }
                         }
                         self.set_status("select a numbered diff row (n / p jump commentable lines)");
+                        Ok(AppEffect::None)
+                    }
+                    _ => Ok(AppEffect::None),
+                },
+                InlineReviewPhase::SubmitPick => match key.code {
+                    KeyCode::Esc => {
+                        *phase = InlineReviewPhase::PickLine;
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *submit_cursor = (*submit_cursor + 1).min(2);
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *submit_cursor = submit_cursor.saturating_sub(1);
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Enter => {
+                        let Some(n) = self.pr_number else {
+                            return Ok(AppEffect::None);
+                        };
+                        let rid = *pending_review_id;
+                        match *submit_cursor {
+                            0 => {
+                                let r = rt.block_on(github::submit_pull_review(
+                                    &self.octo,
+                                    &self.owner,
+                                    &self.repo,
+                                    n,
+                                    rid,
+                                    ReviewAction::Approve,
+                                    "",
+                                ));
+                                match r {
+                                    Ok(_) => {
+                                        self.set_status("Review submitted: APPROVED");
+                                        self.overlay = Overlay::None;
+                                        let _ = self.load_thread(rt);
+                                        let _ = self.load_reviews(rt);
+                                    }
+                                    Err(e) => self.set_status(format!("submit: {e:#}")),
+                                }
+                                Ok(AppEffect::None)
+                            }
+                            1 => Ok(AppEffect::OpenEditor {
+                                initial: "## Request changes\n\nExplain what should be fixed.\n\n"
+                                    .to_string(),
+                                intent: EditorIntent::SubmitPullReview {
+                                    review_id: rid,
+                                    action: ReviewAction::RequestChanges,
+                                },
+                            }),
+                            2 => Ok(AppEffect::OpenEditor {
+                                initial: "## Comment\n\nGeneral review feedback.\n\n".to_string(),
+                                intent: EditorIntent::SubmitPullReview {
+                                    review_id: rid,
+                                    action: ReviewAction::Comment,
+                                },
+                            }),
+                            _ => Ok(AppEffect::None),
+                        }
+                    }
+                    _ => Ok(AppEffect::None),
+                },
+                InlineReviewPhase::ConfirmDiscard => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        *phase = InlineReviewPhase::PickLine;
+                        Ok(AppEffect::None)
+                    }
+                    KeyCode::Char('y') => {
+                        let Some(n) = self.pr_number else {
+                            return Ok(AppEffect::None);
+                        };
+                        let rid = *pending_review_id;
+                        let r = rt.block_on(github::delete_pending_pull_review(
+                            &self.octo,
+                            &self.owner,
+                            &self.repo,
+                            n,
+                            rid,
+                        ));
+                        match r {
+                            Ok(_) => {
+                                self.set_status("pending review discarded on GitHub");
+                                self.overlay = Overlay::None;
+                            }
+                            Err(e) => self.set_status(format!("discard review: {e:#}")),
+                        }
                         Ok(AppEffect::None)
                     }
                     _ => Ok(AppEffect::None),
@@ -2066,9 +2229,13 @@ Comment (markdown). Optional suggestion block:\n\n\
     }
 
     fn start_inline_review_wizard(&mut self, rt: &Runtime) -> anyhow::Result<()> {
-        if self.pr_number.is_none() {
+        let Some(n) = self.pr_number else {
             return Ok(());
-        }
+        };
+        let Some(pr) = self.current_pr.as_ref() else {
+            return Ok(());
+        };
+        let commit_sha = pr.head.sha.clone();
         if self.file_paths.is_empty() {
             self.load_files(rt)?;
         }
@@ -2079,16 +2246,44 @@ Comment (markdown). Optional suggestion block:\n\n\
             self.set_status("no changed files — cannot comment on diff");
             return Ok(());
         }
+        self.loading = true;
+        let oct = self.octo.clone();
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+        let me = self.me.clone();
+        let pending = rt.block_on(github::ensure_pending_pull_review(
+            &oct,
+            &owner,
+            &repo,
+            n,
+            &commit_sha,
+            me.as_deref(),
+        ));
+        self.loading = false;
+        let pending_review_id = match pending {
+            Ok(id) => id,
+            Err(e) => {
+                self.set_status(format!("could not start pending review: {e:#}"));
+                return Ok(());
+            }
+        };
         self.inline_review_file_state = ListState::default();
         self.inline_review_line_state = ListState::default();
+        self.inline_review_submit_state = ListState::default();
         self.overlay = Overlay::InlineReview {
             phase: InlineReviewPhase::PickFile,
             file_cursor: 0,
             path: String::new(),
             diff_lines: Vec::new(),
             line_cursor: 0,
+            pending_review_id,
+            commit_sha,
+            session_comments: Vec::new(),
+            submit_cursor: 0,
         };
-        self.set_status("inline review wizard — pick file (Enter) · mouse · Esc/q quit");
+        self.set_status(format!(
+            "pending review #{pending_review_id} — pick file · comments attach until you press S"
+        ));
         Ok(())
     }
 
@@ -2122,6 +2317,15 @@ Comment (markdown). Optional suggestion block:\n\n\
             } => {
                 if dy < diff_lines.len() {
                     *line_cursor = dy;
+                }
+            }
+            Overlay::InlineReview {
+                phase: InlineReviewPhase::SubmitPick,
+                submit_cursor,
+                ..
+            } => {
+                if dy <= 2 {
+                    *submit_cursor = dy;
                 }
             }
             _ => {}

@@ -4,7 +4,9 @@
 
 use anyhow::Context;
 use octocrab::models::issues::{Comment as IssueComment, Issue};
-use octocrab::models::pulls::{Comment as PullComment, PullRequest, Review, ReviewComment};
+use octocrab::models::pulls::{
+    Comment as PullComment, PullRequest, Review, ReviewAction, ReviewComment, ReviewState,
+};
 use octocrab::models::reactions::{Reaction, ReactionContent};
 use octocrab::models::repos::{DiffEntry, RepoCommit};
 use octocrab::models::CommentId;
@@ -392,6 +394,94 @@ pub async fn list_reviews(
     Ok(oct.all_pages(page).await?)
 }
 
+/// Latest pending review by `login`, if any (same user can have only one pending review per PR).
+pub fn find_pending_review_id_for_user(reviews: &[Review], login: &str) -> Option<u64> {
+    reviews.iter().rev().find_map(|r| {
+        if r.state == Some(ReviewState::Pending)
+            && r.user.as_ref().map(|u| u.login.as_str()) == Some(login)
+        {
+            Some(r.id.into_inner())
+        } else {
+            None
+        }
+    })
+}
+
+/// `event` omitted → GitHub creates a **PENDING** review ([docs](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request)).
+pub async fn create_pending_pull_review(
+    oct: &Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    commit_sha: &str,
+) -> anyhow::Result<Review> {
+    let route = format!("/repos/{owner}/{repo}/pulls/{pr_number}/reviews");
+    let payload = serde_json::json!({
+        "commit_id": commit_sha,
+        "body": "",
+    });
+    Ok(oct.post(route.as_str(), Some(&payload)).await?)
+}
+
+pub async fn ensure_pending_pull_review(
+    oct: &Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    commit_sha: &str,
+    user_login: Option<&str>,
+) -> anyhow::Result<u64> {
+    let reviews = list_reviews(oct, owner, repo, pr_number).await?;
+    if let Some(login) = user_login.filter(|s| !s.is_empty()) {
+        if let Some(id) = find_pending_review_id_for_user(&reviews, login) {
+            return Ok(id);
+        }
+    }
+    match create_pending_pull_review(oct, owner, repo, pr_number, commit_sha).await {
+        Ok(r) => Ok(r.id.into_inner()),
+        Err(first_err) => {
+            // Often 422 if a pending review already exists (e.g. started on github.com).
+            let reviews = list_reviews(oct, owner, repo, pr_number).await?;
+            if let Some(login) = user_login.filter(|s| !s.is_empty()) {
+                if let Some(id) = find_pending_review_id_for_user(&reviews, login) {
+                    return Ok(id);
+                }
+            }
+            Err(first_err.into())
+        }
+    }
+}
+
+pub async fn submit_pull_review(
+    oct: &Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    review_id: u64,
+    event: ReviewAction,
+    body: &str,
+) -> anyhow::Result<Review> {
+    Ok(oct
+        .pulls(owner, repo)
+        .pr_review_actions(pr_number, review_id)
+        .submit(event, body)
+        .await?)
+}
+
+pub async fn delete_pending_pull_review(
+    oct: &Octocrab,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    review_id: u64,
+) -> anyhow::Result<Review> {
+    Ok(oct
+        .pulls(owner, repo)
+        .pr_review_actions(pr_number, review_id)
+        .delete_pending()
+        .await?)
+}
+
 pub async fn create_issue_comment(
     oct: &Octocrab,
     owner: &str,
@@ -460,7 +550,8 @@ pub async fn reply_to_review_comment(
         .await?)
 }
 
-/// Single inline review comment on a PR diff line ([REST](https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request)).
+/// Inline review comment on a PR diff line ([REST](https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request)).
+/// With `pull_request_review_id`, attaches to an existing **pending** review (GitHub.com “Start review” flow).
 pub async fn create_pull_review_inline_comment(
     oct: &Octocrab,
     owner: &str,
@@ -471,15 +562,22 @@ pub async fn create_pull_review_inline_comment(
     line: u32,
     side: &str,
     body: &str,
+    pull_request_review_id: Option<u64>,
 ) -> anyhow::Result<PullComment> {
     let route = format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments");
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "body": body,
         "commit_id": commit_sha,
         "path": path,
         "line": line,
         "side": side,
     });
+    if let Some(rid) = pull_request_review_id {
+        payload
+            .as_object_mut()
+            .expect("json object")
+            .insert("pull_request_review_id".into(), serde_json::json!(rid));
+    }
     Ok(oct.post(route.as_str(), Some(&payload)).await?)
 }
 

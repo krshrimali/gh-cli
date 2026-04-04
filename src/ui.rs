@@ -626,7 +626,7 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MAUVE))
                 .title(Line::from(Span::styled(
-                    " reviews  a inline comment wizard  j/k ",
+                    " reviews  a pending-review wizard  j/k ",
                     Style::default().fg(MAUVE),
                 ))),
         )
@@ -800,30 +800,86 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
             path,
             diff_lines,
             line_cursor,
+            pending_review_id,
+            commit_sha,
+            session_comments,
+            submit_cursor,
         } => {
-            let w = (full.width * 4 / 5).max(44);
-            let h = (full.height * 4 / 5).max(14);
+            let w = (full.width * 5 / 6).max(50).min(full.width.saturating_sub(2));
+            let h = (full.height * 5 / 6).max(16).min(full.height.saturating_sub(2));
             let x = (full.width.saturating_sub(w)) / 2;
             let y = (full.height.saturating_sub(h)) / 2;
             let area = Rect { x, y, width: w, height: h };
             f.render_widget(Clear, area);
-            let block = Block::default()
+            let shell = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(GREEN))
+                .title(Line::from(vec![
+                    Span::styled(" pull request review ", Style::default().fg(GREEN).bold()),
+                    Span::styled(
+                        format!("pending #{pending_review_id}  "),
+                        Style::default().fg(MAUVE),
+                    ),
+                    Span::styled(
+                        format!("@ {} ", &commit_sha[..commit_sha.len().min(7)]),
+                        Style::default().fg(SUB),
+                    ),
+                ]))
                 .style(Style::default().bg(SURFACE).fg(TEXT));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = shell.inner(area);
+            f.render_widget(shell, area);
             match *phase {
                 InlineReviewPhase::PickFile => {
-                    let title = Line::from(Span::styled(
-                        " inline review — pick file  j/k Enter  mouse  Esc/q ",
-                        Style::default().fg(GREEN).bold(),
-                    ));
+                    let rail_w = (inner.width / 3).clamp(22, 36);
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Length(rail_w), Constraint::Min(12)])
+                        .split(inner);
+                    let rail = Block::default()
+                        .borders(Borders::RIGHT)
+                        .border_style(Style::default().fg(MAUVE))
+                        .style(Style::default().bg(BG))
+                        .title(Line::from(Span::styled(
+                            " flow ",
+                            Style::default().fg(MAUVE).bold(),
+                        )));
+                    let ri = rail.inner(cols[0]);
+                    f.render_widget(rail, cols[0]);
+                    let rail_txt = Text::from(vec![
+                        Line::from(Span::styled(
+                            "1  pick file",
+                            Style::default().fg(GREEN),
+                        )),
+                        Line::from(Span::styled(
+                            "2  diff line",
+                            Style::default().fg(SUB),
+                        )),
+                        Line::from(Span::styled(
+                            "3  $EDITOR",
+                            Style::default().fg(SUB),
+                        )),
+                        Line::from(Span::styled(
+                            "S  submit",
+                            Style::default().fg(SUB),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "Comments stack on GitHub until you submit or discard.",
+                            Style::default().fg(SUB),
+                        )),
+                    ]);
+                    f.render_widget(
+                        Paragraph::new(rail_txt).wrap(Wrap { trim: true }),
+                        ri,
+                    );
                     let list_block = Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(ACCENT))
-                        .title(title);
-                    let list_inner = list_block.inner(inner);
+                        .title(Line::from(Span::styled(
+                            " changed files  j/k Enter  mouse ",
+                            Style::default().fg(ACCENT).bold(),
+                        )));
+                    let list_inner = list_block.inner(cols[1]);
                     app.wizard_hit_rect.set(Some(list_inner));
                     let items: Vec<ListItem> = app
                         .file_paths
@@ -849,26 +905,33 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                         let i = (*file_cursor).min(app.file_paths.len().saturating_sub(1));
                         app.inline_review_file_state.select(Some(i));
                     }
-                    f.render_stateful_widget(list, inner, &mut app.inline_review_file_state);
+                    f.render_stateful_widget(list, cols[1], &mut app.inline_review_file_state);
                 }
                 InlineReviewPhase::PickLine => {
-                    let title = Line::from(vec![
-                        Span::styled(" line on ", Style::default().fg(GREEN).bold()),
-                        Span::styled(
-                            path.as_str(),
-                            Style::default().fg(PEACH).bold(),
-                        ),
-                        Span::styled(
-                            "  j/k n/p  Enter $EDITOR  Esc file  q quit ",
-                            Style::default().fg(SUB),
-                        ),
-                    ]);
-                    let list_block = Block::default()
+                    let use_side_by_side = inner.width >= 72;
+                    let body = if use_side_by_side {
+                        Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                            .split(inner)
+                    } else {
+                        Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                            .split(inner)
+                    };
+                    let diff_block = Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(PEACH))
-                        .title(title);
-                    let list_inner = list_block.inner(inner);
-                    app.wizard_hit_rect.set(Some(list_inner));
+                        .title(Line::from(vec![
+                            Span::styled(path.as_str(), Style::default().fg(PEACH).bold()),
+                            Span::styled(
+                                "  j/k · n/p · Enter · S submit · X discard ",
+                                Style::default().fg(SUB),
+                            ),
+                        ]));
+                    let diff_inner = diff_block.inner(body[0]);
+                    app.wizard_hit_rect.set(Some(diff_inner));
                     let items: Vec<ListItem> = diff_lines
                         .iter()
                         .map(|ln| {
@@ -881,7 +944,7 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                         })
                         .collect();
                     let list = List::new(items)
-                        .block(list_block)
+                        .block(diff_block)
                         .highlight_style(
                             Style::default()
                                 .bg(BG)
@@ -894,7 +957,118 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                         let i = (*line_cursor).min(diff_lines.len().saturating_sub(1));
                         app.inline_review_line_state.select(Some(i));
                     }
-                    f.render_stateful_widget(list, inner, &mut app.inline_review_line_state);
+                    f.render_stateful_widget(list, body[0], &mut app.inline_review_line_state);
+                    let sess_title = format!(" this session ({}) ", session_comments.len());
+                    let sess_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(MAUVE))
+                        .title(Line::from(Span::styled(
+                            sess_title,
+                            Style::default().fg(MAUVE).bold(),
+                        )));
+                    let sess_i = sess_block.inner(body[1]);
+                    f.render_widget(sess_block, body[1]);
+                    let sess_body = if session_comments.is_empty() {
+                        Text::from(vec![Line::from(Span::styled(
+                            "No inline comments yet — Enter on a numbered line.",
+                            Style::default().fg(SUB).italic(),
+                        ))])
+                    } else {
+                        Text::from(
+                            session_comments
+                                .iter()
+                                .map(|s| {
+                                    Line::from(Span::styled(
+                                        PrListEntry::ellipsize(s, sess_i.width.saturating_sub(2) as usize),
+                                        Style::default().fg(TEXT),
+                                    ))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    f.render_widget(
+                        Paragraph::new(sess_body).wrap(Wrap { trim: true }),
+                        sess_i,
+                    );
+                }
+                InlineReviewPhase::SubmitPick => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(2), Constraint::Min(6)])
+                        .split(inner);
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(
+                                "Submit pending review  ",
+                                Style::default().fg(GREEN).bold(),
+                            ),
+                            Span::styled(
+                                "j/k Enter · Esc back · Approve is immediate",
+                                Style::default().fg(SUB),
+                            ),
+                        ])),
+                        chunks[0],
+                    );
+                    let list_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(GREEN));
+                    let list_inner = list_block.inner(chunks[1]);
+                    app.wizard_hit_rect.set(Some(list_inner));
+                    let labels = [
+                        " APPROVE — ship it (no editor)",
+                        " REQUEST CHANGES — opens $EDITOR (body required)",
+                        " COMMENT — general feedback via $EDITOR",
+                    ];
+                    let items: Vec<ListItem> = labels
+                        .iter()
+                        .map(|l| {
+                            ListItem::new(Span::styled(
+                                *l,
+                                Style::default().fg(TEXT),
+                            ))
+                        })
+                        .collect();
+                    let list = List::new(items)
+                        .block(list_block)
+                        .highlight_style(
+                            Style::default()
+                                .bg(BG)
+                                .fg(GREEN)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                    let i = (*submit_cursor).min(2);
+                    app.inline_review_submit_state.select(Some(i));
+                    f.render_stateful_widget(
+                        list,
+                        chunks[1],
+                        &mut app.inline_review_submit_state,
+                    );
+                }
+                InlineReviewPhase::ConfirmDiscard => {
+                    app.wizard_hit_rect.set(None);
+                    let txt = Text::from(vec![
+                        Line::from(""),
+                        Line::from(
+                            Span::styled(
+                                "Discard this pending review on GitHub?",
+                                Style::default().fg(RED).bold(),
+                            ),
+                        ),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "All draft inline comments in this review will be removed.",
+                            Style::default().fg(SUB),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "y  confirm     n / Esc  cancel",
+                            Style::default().fg(TEXT),
+                        )),
+                    ]);
+                    f.render_widget(
+                        Paragraph::new(txt).alignment(Alignment::Center),
+                        inner,
+                    );
                 }
             }
         }
@@ -965,8 +1139,11 @@ THREAD (tab 2) — review with code context\n\
 \n\
 REVIEWS (tab 6)\n\
   j k           scroll submitted reviews list\n\
-  a             start inline review: pick file → diff line → $EDITOR → POST to GitHub\n\
-                Mouse selects rows; n/p jump lines that accept a comment; ```suggestion blocks apply on web\n\
+  a             pending review wizard (GitHub “Start review”)\n\
+                Creates or reuses your PENDING review; each Enter comment attaches to it\n\
+                S             submit: Approve (instant) | Request changes | Comment ($EDITOR)\n\
+                X             discard pending review (y confirm)\n\
+                Mouse + n/p   row pick / jump commentable diff lines · ```suggestion works on github.com\n\
 \n\
 FILTERS  (:command from any screen, refreshes list)\n\
   :filter clear | show    :state open|closed|merged|draft|all\n\
