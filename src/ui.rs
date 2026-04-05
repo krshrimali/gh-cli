@@ -28,6 +28,11 @@ const RED: Color = Color::Rgb(243, 139, 168);
 const DIFF_DEL_BG: Color = Color::Rgb(52, 36, 42);
 const DIFF_ADD_BG: Color = Color::Rgb(36, 48, 42);
 
+/// Clamp a usize scroll offset to u16 range so large values don't wrap to 0.
+fn scroll_u16(v: usize) -> u16 {
+    v.min(u16::MAX as usize) as u16
+}
+
 pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.pr_list_hit_rect.set(None);
     app.compose_hit_files.set(None);
@@ -327,7 +332,7 @@ fn draw_tab_info(f: &mut Frame<'_>, app: &mut App, pr: &octocrab::models::pulls:
     let body = pr.body.as_deref().unwrap_or("_No description provided._");
     let p = Paragraph::new(body)
         .wrap(Wrap { trim: true })
-        .scroll((app.tab_scroll as u16, 0))
+        .scroll((scroll_u16(app.tab_scroll), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -464,7 +469,7 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let hunk_widget = Paragraph::new(hunk_text.as_str())
         .style(Style::default().fg(SUB))
         .wrap(Wrap { trim: false })
-        .scroll((app.thread_hunk_scroll as u16, 0))
+        .scroll((scroll_u16(app.thread_hunk_scroll), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -497,7 +502,7 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let p = Paragraph::new(body)
         .wrap(Wrap { trim: true })
-        .scroll((app.thread_detail_scroll as u16, 0))
+        .scroll((scroll_u16(app.thread_detail_scroll), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -624,7 +629,7 @@ fn draw_tab_files(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn draw_tab_diff(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let p = Paragraph::new(app.diff_text.as_str())
         .wrap(Wrap { trim: false })
-        .scroll((app.diff_scroll as u16, 0))
+        .scroll((scroll_u16(app.diff_scroll), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1317,7 +1322,7 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
             f.render_widget(Clear, area);
             let p = Paragraph::new(body.as_str())
                 .wrap(Wrap { trim: true })
-                .scroll((*scroll as u16, 0))
+                .scroll((scroll_u16(*scroll), 0))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -1489,6 +1494,71 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                     .title(" new PR — head/base prefilled from git when possible ")
                     .style(Style::default().bg(SURFACE).fg(TEXT)),
             );
+            f.render_widget(p, area);
+        }
+        Overlay::ConfirmDelete { .. } => {
+            let w = 50u16;
+            let h = 7u16;
+            let x = (full.width.saturating_sub(w)) / 2;
+            let y = (full.height.saturating_sub(h)) / 2;
+            let area = Rect { x, y, width: w, height: h };
+            f.render_widget(Clear, area);
+            let text = Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Delete this comment?",
+                    Style::default().fg(RED).bold(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "y  yes     n / Esc  cancel",
+                    Style::default().fg(TEXT),
+                )),
+            ]);
+            let p = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(RED))
+                        .title(" confirm delete ")
+                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                );
+            f.render_widget(p, area);
+        }
+        Overlay::ConfirmMerge { method } => {
+            let label = match *method {
+                1 => "squash",
+                2 => "rebase",
+                _ => "merge",
+            };
+            let w = 54u16;
+            let h = 7u16;
+            let x = (full.width.saturating_sub(w)) / 2;
+            let y = (full.height.saturating_sub(h)) / 2;
+            let area = Rect { x, y, width: w, height: h };
+            f.render_widget(Clear, area);
+            let text = Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("Merge this PR ({label})?"),
+                    Style::default().fg(PEACH).bold(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "y  yes     n / Esc  cancel",
+                    Style::default().fg(TEXT),
+                )),
+            ]);
+            let p = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(PEACH))
+                        .title(" confirm merge ")
+                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                );
             f.render_widget(p, area);
         }
     }

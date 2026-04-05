@@ -56,7 +56,7 @@ pub fn parse_pr_status_filter(s: &str) -> Option<PrStatusFilter> {
     })
 }
 
-use octocrab::{Octocrab, Page};
+use octocrab::{Error as OctocrabError, Octocrab, Page};
 use serde::Serialize;
 
 /// Page size for PR list requests (GitHub allows up to 100).
@@ -423,6 +423,13 @@ pub async fn create_pending_pull_review(
     Ok(oct.post(route.as_str(), Some(&payload)).await?)
 }
 
+/// Ensures the authenticated user has exactly one **pending** review on this PR, creating it if needed.
+///
+/// If `user_login` is missing (e.g. the app never loaded the list and `me` is unset), this calls
+/// `current_login` so we can reuse a pending review you already have on github.com. Without that,
+/// this function would always try `create_pending_pull_review` and get 422 (“one pending review”).
+/// That path runs only when you press **`a`** to open the composer — posting an inline comment uses
+/// `POST …/pulls/{n}/comments` only and does not create another review here.
 pub async fn ensure_pending_pull_review(
     oct: &Octocrab,
     owner: &str,
@@ -431,9 +438,14 @@ pub async fn ensure_pending_pull_review(
     commit_sha: &str,
     user_login: Option<&str>,
 ) -> anyhow::Result<u64> {
+    let login: Option<String> = match user_login.filter(|s| !s.is_empty()) {
+        Some(l) => Some(l.to_string()),
+        None => current_login(oct).await.ok().flatten(),
+    };
+
     let reviews = list_reviews(oct, owner, repo, pr_number).await?;
-    if let Some(login) = user_login.filter(|s| !s.is_empty()) {
-        if let Some(id) = find_pending_review_id_for_user(&reviews, login) {
+    if let Some(ref l) = login {
+        if let Some(id) = find_pending_review_id_for_user(&reviews, l) {
             return Ok(id);
         }
     }
@@ -442,8 +454,8 @@ pub async fn ensure_pending_pull_review(
         Err(first_err) => {
             // Often 422 if a pending review already exists (e.g. started on github.com).
             let reviews = list_reviews(oct, owner, repo, pr_number).await?;
-            if let Some(login) = user_login.filter(|s| !s.is_empty()) {
-                if let Some(id) = find_pending_review_id_for_user(&reviews, login) {
+            if let Some(ref l) = login {
+                if let Some(id) = find_pending_review_id_for_user(&reviews, l) {
                     return Ok(id);
                 }
             }
@@ -480,23 +492,6 @@ pub async fn delete_pending_pull_review(
         .pr_review_actions(pr_number, review_id)
         .delete_pending()
         .await?)
-}
-
-/// Drop the given user's **pending** review on this PR (if any). Use when GitHub returns
-/// "only one pending review per pull request" or to clear a review started on the website.
-pub async fn delete_pending_review_for_login(
-    oct: &Octocrab,
-    owner: &str,
-    repo: &str,
-    pr_number: u64,
-    login: &str,
-) -> anyhow::Result<Option<u64>> {
-    let reviews = list_reviews(oct, owner, repo, pr_number).await?;
-    let Some(id) = find_pending_review_id_for_user(&reviews, login) else {
-        return Ok(None);
-    };
-    delete_pending_pull_review(oct, owner, repo, pr_number, id).await?;
-    Ok(Some(id))
 }
 
 pub async fn create_issue_comment(
@@ -567,6 +562,25 @@ pub async fn reply_to_review_comment(
         .await?)
 }
 
+/// Human-readable GitHub error for the status bar; full text also printed to stderr.
+pub fn format_inline_comment_octocrab_err(err: &OctocrabError) -> String {
+    match err {
+        OctocrabError::GitHub { source, .. } => {
+            let mut parts = vec![source.message.clone()];
+            if let Some(es) = &source.errors {
+                if let Ok(j) = serde_json::to_string(es) {
+                    parts.push(j);
+                }
+            }
+            if let Some(d) = &source.documentation_url {
+                parts.push(d.clone());
+            }
+            parts.join(" · ")
+        }
+        _ => err.to_string(),
+    }
+}
+
 /// Inline review comment on a PR diff line ([REST](https://docs.github.com/en/rest/pulls/comments#create-a-review-comment-for-a-pull-request)).
 ///
 /// Do **not** send `pull_request_review_id` in the JSON body: it is not in GitHub’s published
@@ -587,23 +601,26 @@ pub async fn create_pull_review_inline_comment(
     body: &str,
     start_line: Option<u32>,
     start_side: Option<&str>,
-) -> anyhow::Result<PullComment> {
+) -> octocrab::Result<PullComment> {
     let route = format!("/repos/{owner}/{repo}/pulls/{pr_number}/comments");
-    let mut payload = serde_json::json!({
-        "body": body,
-        "commit_id": commit_sha,
-        "path": path,
+    let mut positioning = serde_json::json!({
+        "subject_type": "line",
         "line": line,
         "side": side,
     });
-    let obj = payload.as_object_mut().expect("json object");
     if let Some(sl) = start_line {
-        obj.insert("start_line".into(), serde_json::json!(sl));
+        positioning.as_object_mut().unwrap().insert("start_line".into(), serde_json::json!(sl));
     }
     if let Some(ss) = start_side {
-        obj.insert("start_side".into(), serde_json::json!(ss));
+        positioning.as_object_mut().unwrap().insert("start_side".into(), serde_json::json!(ss));
     }
-    Ok(oct.post(route.as_str(), Some(&payload)).await?)
+    let payload = serde_json::json!({
+        "body": body,
+        "commit_id": commit_sha,
+        "path": path,
+        "positioning": positioning,
+    });
+    oct.post(route.as_str(), Some(&payload)).await
 }
 
 #[derive(Serialize)]

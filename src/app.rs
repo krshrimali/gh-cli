@@ -6,7 +6,7 @@ use crate::markdown_render;
 use crate::ui;
 use crate::github;
 use std::collections::HashMap;
-use anyhow::Context;
+use anyhow::{bail, Context};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -421,6 +421,10 @@ pub enum Overlay {
     },
     /// PR filters + status (`f`; `s` opens status, `A` jumps to status).
     FilterSummary(FilterPanelPhase),
+    /// Confirm comment deletion (d key in Thread tab).
+    ConfirmDelete { id: CommentId, is_review: bool },
+    /// Confirm PR merge (:merge command).
+    ConfirmMerge { method: u8 },
 }
 
 pub enum EditorIntent {
@@ -529,8 +533,6 @@ pub struct App {
     pub inline_review_submit_state: ListState,
     /// Reviews tab: split-pane composer (`a`), None = browse submitted reviews list.
     pub reviews_composer: Option<ReviewsComposer>,
-    /// Reviews tab (no composer): `D` then `y` to delete your pending review on GitHub.
-    pub reviews_remote_discard_confirm: bool,
     pub compose_hit_files: Cell<Option<Rect>>,
     pub compose_hit_diff: Cell<Option<Rect>>,
     pub compose_hit_actions: Cell<Option<Rect>>,
@@ -691,6 +693,7 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal, rt: &Runtime) -> anyhow::Result<()> {
         let _mouse_guard = MouseCaptureGuard::new()?;
+        let _kb_guard = KeyboardEnhancementGuard::new();
 
         self.set_status("Loading first page of pull requests…");
         self.loading = true;
@@ -947,6 +950,9 @@ impl App {
                 self.screen = Screen::PrDetail;
                 self.pr_number = Some(number);
                 self.current_pr = Some(p);
+                if self.me.is_none() {
+                    self.me = rt.block_on(github::current_login(&self.octo)).ok().flatten();
+                }
                 self.pr_tab = PrTab::Thread;
                 self.clear_detail_views();
                 self.load_thread(rt)?;
@@ -1390,6 +1396,11 @@ impl App {
             return Ok(AppEffect::None);
         }
 
+        // Ctrl+C always quits to ensure the terminal is restored cleanly.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(AppEffect::Quit);
+        }
+
         if !matches!(self.overlay, Overlay::None) {
             return self.handle_overlay_key(key, rt);
         }
@@ -1598,6 +1609,81 @@ impl App {
                 }
                 _ => Ok(AppEffect::None),
             },
+            Overlay::ConfirmDelete { id, is_review } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let cid = *id;
+                        let review = *is_review;
+                        self.overlay = Overlay::None;
+                        if review {
+                            let r = rt.block_on(github::delete_review_comment(
+                                &self.octo,
+                                &self.owner,
+                                &self.repo,
+                                cid,
+                            ));
+                            match r {
+                                Ok(()) => {
+                                    self.set_status("deleted");
+                                    let _ = self.load_thread(rt);
+                                }
+                                Err(e) => self.set_status(format!("delete: {e:#}")),
+                            }
+                        } else {
+                            let r = rt.block_on(github::delete_issue_comment(
+                                &self.octo,
+                                &self.owner,
+                                &self.repo,
+                                cid,
+                            ));
+                            match r {
+                                Ok(()) => {
+                                    self.set_status("deleted");
+                                    let _ = self.load_thread(rt);
+                                }
+                                Err(e) => self.set_status(format!("delete: {e:#}")),
+                            }
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.overlay = Overlay::None;
+                        self.set_status("delete cancelled");
+                    }
+                    _ => {}
+                }
+                Ok(AppEffect::None)
+            }
+            Overlay::ConfirmMerge { method } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let m = match *method {
+                            1 => MergeMethod::Squash,
+                            2 => MergeMethod::Rebase,
+                            _ => MergeMethod::Merge,
+                        };
+                        self.overlay = Overlay::None;
+                        if let Some(n) = self.pr_number {
+                            let r = rt.block_on(github::merge_pull(
+                                &self.octo,
+                                &self.owner,
+                                &self.repo,
+                                n,
+                                m,
+                            ));
+                            match r {
+                                Ok(()) => self.set_status("merge requested"),
+                                Err(e) => self.set_status(format!("merge: {e:#}")),
+                            }
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.overlay = Overlay::None;
+                        self.set_status("merge cancelled");
+                    }
+                    _ => {}
+                }
+                Ok(AppEffect::None)
+            }
             Overlay::None => Ok(AppEffect::None),
         }
     }
@@ -1645,23 +1731,13 @@ impl App {
                 }
             }
             "merge" if self.screen == Screen::PrDetail => {
-                let method = match parts.get(1).copied().unwrap_or("merge") {
-                    "squash" => MergeMethod::Squash,
-                    "rebase" => MergeMethod::Rebase,
-                    _ => MergeMethod::Merge,
+                let method_id: u8 = match parts.get(1).copied().unwrap_or("merge") {
+                    "squash" => 1,
+                    "rebase" => 2,
+                    _ => 0,
                 };
-                if let Some(n) = self.pr_number {
-                    let r = rt.block_on(github::merge_pull(
-                        &self.octo,
-                        &self.owner,
-                        &self.repo,
-                        n,
-                        method,
-                    ));
-                    match r {
-                        Ok(()) => self.set_status("merge requested"),
-                        Err(e) => self.set_status(format!("merge: {e:#}")),
-                    }
+                if self.pr_number.is_some() {
+                    self.overlay = Overlay::ConfirmMerge { method: method_id };
                 }
             }
             "update-branch" | "ub" if self.screen == Screen::PrDetail => {
@@ -1925,7 +2001,9 @@ impl App {
     }
 
     fn handle_pr_detail(&mut self, key: KeyEvent, rt: &Runtime) -> anyhow::Result<AppEffect> {
-        let _ = self.ensure_tab_loaded(rt);
+        if let Err(e) = self.ensure_tab_loaded(rt) {
+            self.set_status(format!("tab load: {e:#}"));
+        }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -2094,38 +2172,11 @@ impl App {
                         if !self.author_is_me(auth) {
                             self.set_status("can only delete your own comments");
                         } else {
-                            match it {
-                                ThreadItem::Issue { id, .. } => {
-                                    let r = rt.block_on(github::delete_issue_comment(
-                                        &self.octo,
-                                        &self.owner,
-                                        &self.repo,
-                                        *id,
-                                    ));
-                                    match r {
-                                        Ok(()) => {
-                                            self.set_status("deleted");
-                                            let _ = self.load_thread(rt);
-                                        }
-                                        Err(e) => self.set_status(format!("delete: {e:#}")),
-                                    }
-                                }
-                                ThreadItem::Review { id, .. } => {
-                                    let r = rt.block_on(github::delete_review_comment(
-                                        &self.octo,
-                                        &self.owner,
-                                        &self.repo,
-                                        *id,
-                                    ));
-                                    match r {
-                                        Ok(()) => {
-                                            self.set_status("deleted");
-                                            let _ = self.load_thread(rt);
-                                        }
-                                        Err(e) => self.set_status(format!("delete: {e:#}")),
-                                    }
-                                }
-                            }
+                            let (cid, is_review) = match it {
+                                ThreadItem::Issue { id, .. } => (*id, false),
+                                ThreadItem::Review { id, .. } => (*id, true),
+                            };
+                            self.overlay = Overlay::ConfirmDelete { id: cid, is_review };
                         }
                     }
                 }
@@ -2173,7 +2224,9 @@ impl App {
                         }
                         self.pr_tab = tab;
                         self.tab_scroll = 0;
-                        let _ = self.ensure_tab_loaded(rt);
+                        if let Err(e) = self.ensure_tab_loaded(rt) {
+                            self.set_status(format!("tab load: {e:#}"));
+                        }
                     }
                 }
             }
@@ -2544,6 +2597,9 @@ Comment (markdown). Optional suggestion:\n\n\
             self.set_status("no changed files — cannot comment on diff");
             return Ok(());
         }
+        if self.me.is_none() {
+            self.me = rt.block_on(github::current_login(&self.octo)).ok().flatten();
+        }
         self.loading = true;
         let oct = self.octo.clone();
         let owner = self.owner.clone();
@@ -2876,7 +2932,89 @@ Comment (markdown). Optional suggestion:\n\n\
         }
     }
 
-    /// Post one inline comment on the current pending review (shared by $EDITOR and in-tab draft).
+    /// Refreshes PR head + unified diff so `commit_id` matches the patch used for line anchors.
+    fn sync_review_composer_to_pr_head(&mut self, rt: &Runtime) -> anyhow::Result<()> {
+        let Some(n) = self.pr_number else {
+            return Ok(());
+        };
+        let Some(comp) = self.reviews_composer.as_mut() else {
+            return Ok(());
+        };
+
+        let pull = rt.block_on(github::get_pull(
+            &self.octo,
+            &self.owner,
+            &self.repo,
+            n,
+        ))?;
+        let new_sha = pull.head.sha.clone();
+        self.current_pr = Some(pull);
+
+        let sha_changed = new_sha != comp.commit_sha;
+        if !sha_changed && !self.diff_text.is_empty() {
+            return Ok(());
+        }
+
+        comp.commit_sha = new_sha;
+
+        let mut diff_s = rt.block_on(github::get_pr_diff(
+            &self.octo,
+            &self.owner,
+            &self.repo,
+            n,
+        ))?;
+        const MAX: usize = 256 * 1024;
+        if diff_s.len() > MAX {
+            diff_s.truncate(MAX);
+            diff_s.push_str("\n\n… truncated (diff too large) …");
+        }
+        self.diff_text = diff_s;
+
+        let path = comp.path.clone();
+        if path.is_empty() {
+            return Ok(());
+        }
+
+        let anchor_before = comp
+            .diff_lines
+            .get(comp.line_cursor)
+            .and_then(|l| l.anchor)
+            .map(|(ln, s)| (ln, s.to_string()));
+
+        match diff_pick::extract_file_patch(&self.diff_text, &path) {
+            Some(chunk) if !(chunk.contains("Binary files ") && chunk.contains(" differ")) => {
+                let lines = diff_pick::parse_patch_lines(chunk);
+                comp.diff_lines = lines;
+                comp.line_cursor = if let Some((ln, ref side)) = anchor_before {
+                    let want: &'static str = match side.as_str() {
+                        "LEFT" => "LEFT",
+                        _ => "RIGHT",
+                    };
+                    comp.diff_lines
+                        .iter()
+                        .position(|l| l.anchor == Some((ln, want)))
+                        .or_else(|| diff_pick::first_anchor_index(&comp.diff_lines))
+                        .unwrap_or(0)
+                } else {
+                    diff_pick::first_anchor_index(&comp.diff_lines).unwrap_or(0)
+                };
+            }
+            _ => {
+                comp.comment_draft = None;
+                comp.range_start = None;
+                comp.range_end = None;
+                comp.diff_lines.clear();
+                comp.path.clear();
+                bail!(
+                    "PR changed on GitHub — that file is gone from the diff. Pick it again in Files (diff refreshed)"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Post one inline comment via `POST …/pulls/{pr}/comments` only (does **not** create a review).
     fn finish_pending_inline_comment(
         &mut self,
         rt: &Runtime,
@@ -2890,6 +3028,20 @@ Comment (markdown). Optional suggestion:\n\n\
         start_line: Option<u32>,
         start_side: Option<&str>,
     ) -> anyhow::Result<()> {
+        if self.reviews_composer.is_some() {
+            self.sync_review_composer_to_pr_head(rt)?;
+            if !diff_pick::patch_has_anchor(&self.diff_text, path, line, side) {
+                bail!(
+                    "line {line} ({side}) is not in the current diff for `{path}` — pick the line again (branch may have moved)"
+                );
+            }
+        }
+        let commit_sha = self
+            .reviews_composer
+            .as_ref()
+            .map(|c| c.commit_sha.as_str())
+            .unwrap_or(commit_sha);
+
         let r = rt.block_on(github::create_pull_review_inline_comment(
             &self.octo,
             &self.owner,
@@ -2924,10 +3076,59 @@ Comment (markdown). Optional suggestion:\n\n\
                 Ok(())
             }
             Err(e) => {
-                self.set_status(format!("inline comment: {e:#}"));
+                let report = github::format_inline_comment_octocrab_err(&e);
+                eprintln!("gh-pr-cli: inline comment failed\n{report}\n(full: {e:#})\n");
+                self.set_status(format!("inline comment: {report}"));
                 Err(e.into())
             }
         }
+    }
+
+    /// Submit the current inline comment draft to the pending review. Shared by all submit keybindings.
+    fn submit_comment_draft(&mut self, rt: &Runtime) -> anyhow::Result<Option<AppEffect>> {
+        let pr_n = self.pr_number;
+        let (body, path, line, side, sl, ss, pend, sha) = {
+            let c = self.reviews_composer.as_mut().unwrap();
+            let d = c.comment_draft.as_ref().unwrap();
+            (
+                d.chars.iter().collect::<String>(),
+                d.path.clone(),
+                d.line,
+                d.side.clone(),
+                d.start_line,
+                d.start_side.clone(),
+                c.pending_review_id,
+                c.commit_sha.clone(),
+            )
+        };
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            self.set_status("empty comment — add text or Esc");
+            return Ok(Some(AppEffect::None));
+        }
+        let Some(pr) = pr_n else {
+            return Ok(Some(AppEffect::None));
+        };
+        let ok = self
+            .finish_pending_inline_comment(
+                rt,
+                pr,
+                pend,
+                &sha,
+                &path,
+                line,
+                &side,
+                trimmed,
+                sl,
+                ss.as_deref(),
+            )
+            .is_ok();
+        if ok {
+            if let Some(c) = self.reviews_composer.as_mut() {
+                c.comment_draft = None;
+            }
+        }
+        Ok(Some(AppEffect::None))
     }
 
     fn handle_reviews_comment_draft_key(
@@ -2938,7 +3139,6 @@ Comment (markdown). Optional suggestion:\n\n\
         if key.kind != KeyEventKind::Press {
             return Ok(Some(AppEffect::None));
         }
-        let pr_n = self.pr_number;
         if !self
             .reviews_composer
             .as_ref()
@@ -2958,141 +3158,12 @@ Comment (markdown). Optional suggestion:\n\n\
                 self.set_status("comment draft closed");
                 Ok(Some(AppEffect::None))
             }
-            KeyCode::Enter if ctrl || alt => {
-                let (body, path, line, side, sl, ss, pend, sha) = {
-                    let c = self.reviews_composer.as_mut().unwrap();
-                    let d = c.comment_draft.as_ref().unwrap();
-                    (
-                        d.chars.iter().collect::<String>(),
-                        d.path.clone(),
-                        d.line,
-                        d.side.clone(),
-                        d.start_line,
-                        d.start_side.clone(),
-                        c.pending_review_id,
-                        c.commit_sha.clone(),
-                    )
-                };
-                let trimmed = body.trim();
-                if trimmed.is_empty() {
-                    self.set_status("empty comment — add text or Esc");
-                    return Ok(Some(AppEffect::None));
-                }
-                let Some(pr) = pr_n else {
-                    return Ok(Some(AppEffect::None));
-                };
-                let ok = self
-                    .finish_pending_inline_comment(
-                        rt,
-                        pr,
-                        pend,
-                        &sha,
-                        &path,
-                        line,
-                        &side,
-                        trimmed,
-                        sl,
-                        ss.as_deref(),
-                    )
-                    .is_ok();
-                if ok {
-                    if let Some(c) = self.reviews_composer.as_mut() {
-                        c.comment_draft = None;
-                    }
-                }
-                Ok(Some(AppEffect::None))
-            }
-            KeyCode::Char('s') if ctrl => {
-                // Same terminals swallow Ctrl+Enter; Ctrl+S also submits.
-                let (body, path, line, side, sl, ss, pend, sha) = {
-                    let c = self.reviews_composer.as_mut().unwrap();
-                    let d = c.comment_draft.as_ref().unwrap();
-                    (
-                        d.chars.iter().collect::<String>(),
-                        d.path.clone(),
-                        d.line,
-                        d.side.clone(),
-                        d.start_line,
-                        d.start_side.clone(),
-                        c.pending_review_id,
-                        c.commit_sha.clone(),
-                    )
-                };
-                let trimmed = body.trim();
-                if trimmed.is_empty() {
-                    self.set_status("empty comment — add text or Esc");
-                    return Ok(Some(AppEffect::None));
-                }
-                let Some(pr) = pr_n else {
-                    return Ok(Some(AppEffect::None));
-                };
-                let ok = self
-                    .finish_pending_inline_comment(
-                        rt,
-                        pr,
-                        pend,
-                        &sha,
-                        &path,
-                        line,
-                        &side,
-                        trimmed,
-                        sl,
-                        ss.as_deref(),
-                    )
-                    .is_ok();
-                if ok {
-                    if let Some(c) = self.reviews_composer.as_mut() {
-                        c.comment_draft = None;
-                    }
-                }
-                Ok(Some(AppEffect::None))
-            }
-            KeyCode::F(2) => {
-                let (body, path, line, side, sl, ss, pend, sha) = {
-                    let c = self.reviews_composer.as_mut().unwrap();
-                    let d = c.comment_draft.as_ref().unwrap();
-                    (
-                        d.chars.iter().collect::<String>(),
-                        d.path.clone(),
-                        d.line,
-                        d.side.clone(),
-                        d.start_line,
-                        d.start_side.clone(),
-                        c.pending_review_id,
-                        c.commit_sha.clone(),
-                    )
-                };
-                let trimmed = body.trim();
-                if trimmed.is_empty() {
-                    self.set_status("empty comment — add text or Esc");
-                    return Ok(Some(AppEffect::None));
-                }
-                let Some(pr) = pr_n else {
-                    return Ok(Some(AppEffect::None));
-                };
-                let ok = self
-                    .finish_pending_inline_comment(
-                        rt,
-                        pr,
-                        pend,
-                        &sha,
-                        &path,
-                        line,
-                        &side,
-                        trimmed,
-                        sl,
-                        ss.as_deref(),
-                    )
-                    .is_ok();
-                if ok {
-                    if let Some(c) = self.reviews_composer.as_mut() {
-                        c.comment_draft = None;
-                    }
-                }
-                Ok(Some(AppEffect::None))
-            }
+            // Submit: Ctrl+Enter, Alt+Enter, Ctrl+S, F2
+            KeyCode::Enter if ctrl || alt => self.submit_comment_draft(rt),
+            KeyCode::Char('s') if ctrl => self.submit_comment_draft(rt),
+            KeyCode::F(2) => self.submit_comment_draft(rt),
             KeyCode::Char('e') if ctrl => {
-                let Some(pr) = pr_n else {
+                let Some(pr) = self.pr_number else {
                     return Ok(Some(AppEffect::None));
                 };
                 let Some(taken) = self
@@ -3347,5 +3418,34 @@ impl MouseCaptureGuard {
 impl Drop for MouseCaptureGuard {
     fn drop(&mut self) {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+}
+
+/// Enables the Kitty keyboard protocol so that Ctrl+Enter is distinguishable from Enter.
+/// Gracefully does nothing on terminals that don't support it.
+struct KeyboardEnhancementGuard {
+    enabled: bool,
+}
+
+impl KeyboardEnhancementGuard {
+    fn new() -> Self {
+        let ok = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+        Self { enabled: ok.is_ok() }
+    }
+}
+
+impl Drop for KeyboardEnhancementGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+        }
     }
 }

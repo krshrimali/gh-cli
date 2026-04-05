@@ -192,6 +192,20 @@ pub fn first_anchor_index(lines: &[DiffDisplayLine]) -> Option<usize> {
     lines.iter().position(|l| l.anchor.is_some())
 }
 
+/// True if `(line, side)` is still a commentable row in the current unified diff for `path`.
+pub fn patch_has_anchor(full_diff: &str, path: &str, line: u32, side: &str) -> bool {
+    let Some(chunk) = extract_file_patch(full_diff, path) else {
+        return false;
+    };
+    let want: &'static str = match side {
+        "LEFT" => "LEFT",
+        _ => "RIGHT",
+    };
+    parse_patch_lines(chunk)
+        .iter()
+        .any(|l| l.anchor == Some((line, want)))
+}
+
 /// Next/previous index that has a GitHub anchor (skips headers and `@@` lines).
 pub fn step_anchor(cursor: usize, lines: &[DiffDisplayLine], forward: bool) -> usize {
     if lines.is_empty() {
