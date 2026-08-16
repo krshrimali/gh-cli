@@ -1,4 +1,4 @@
-//! Layout and styling (Catppuccin-inspired palette on dark backgrounds).
+//! Layout and styling for the active color theme.
 
 use crate::app::{
     App, FilterPanelPhase, HelpContext, InlineCommentDraft, Overlay, PrListEntry, PrTab,
@@ -7,6 +7,7 @@ use crate::app::{
 use crate::diff_pick::{DiffDisplayLine, DiffLineKind};
 use crate::github;
 use crate::markdown_render;
+use crate::theme;
 use octocrab::models::CommentId;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -15,18 +16,17 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
 
-const BG: Color = Color::Rgb(30, 30, 46);
-const SURFACE: Color = Color::Rgb(49, 50, 68);
-const TEXT: Color = Color::Rgb(205, 214, 244);
-const SUB: Color = Color::Rgb(166, 173, 200);
-const ACCENT: Color = Color::Rgb(137, 180, 250);
-const GREEN: Color = Color::Rgb(166, 227, 161);
-const PEACH: Color = Color::Rgb(250, 179, 135);
-const MAUVE: Color = Color::Rgb(203, 166, 247);
-const RED: Color = Color::Rgb(243, 139, 168);
-/// GitHub-like diff row tint (dark Catppuccin).
-const DIFF_DEL_BG: Color = Color::Rgb(52, 36, 42);
-const DIFF_ADD_BG: Color = Color::Rgb(36, 48, 42);
+fn bg() -> Color { theme::current().bg }
+fn surface() -> Color { theme::current().surface }
+fn theme_text() -> Color { theme::current().text }
+fn sub() -> Color { theme::current().sub }
+fn accent() -> Color { theme::current().accent }
+fn green() -> Color { theme::current().green }
+fn peach() -> Color { theme::current().peach }
+fn mauve() -> Color { theme::current().mauve }
+fn red() -> Color { theme::current().red }
+fn diff_del_bg() -> Color { theme::current().diff_del_bg }
+fn diff_add_bg() -> Color { theme::current().diff_add_bg }
 
 /// Clamp a usize scroll offset to u16 range so large values don't wrap to 0.
 fn scroll_u16(v: usize) -> u16 {
@@ -40,7 +40,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     app.compose_hit_actions.set(None);
     let full = f.area();
     f.render_widget(
-        Block::default().style(Style::default().bg(BG)),
+        Block::default().style(Style::default().bg(bg())),
         full,
     );
 
@@ -59,7 +59,7 @@ pub fn draw(f: &mut Frame<'_>, app: &mut App) {
     if app.loading {
         let line = Line::from(vec![Span::styled(
             "  … loading …",
-            Style::default().fg(MAUVE).add_modifier(Modifier::ITALIC),
+            Style::default().fg(mauve()).add_modifier(Modifier::ITALIC),
         )]);
         f.render_widget(Paragraph::new(line), chunks[1]);
     }
@@ -81,22 +81,22 @@ fn draw_header(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .as_deref()
         .map(|s| format!(" @{s}"))
         .unwrap_or_default();
-    let title = format!(" gh-pr-cli  —  {}/{}{} ", app.owner, app.repo, who);
+    let title = format!(" gh-pr-cli  —  {}/{}{}  ·  theme:{} ", app.owner, app.repo, who, app.theme.label());
     let block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(SURFACE).fg(TEXT));
+        .border_style(Style::default().fg(accent()))
+        .style(Style::default().bg(surface()).fg(theme_text()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let line = Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(MAUVE)),
+        Span::styled("◆ ", Style::default().fg(mauve())),
         Span::styled(
             title.trim(),
             Style::default()
-                .fg(TEXT)
+                .fg(theme_text())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  vim-style keys  ·  ? help", Style::default().fg(SUB)),
+        Span::styled("  vim-style keys  ·  t theme  ·  ? help", Style::default().fg(sub())),
     ]);
     f.render_widget(
         Paragraph::new(line).alignment(Alignment::Left),
@@ -107,12 +107,12 @@ fn draw_header(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn draw_status(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(SURFACE));
+        .border_style(Style::default().fg(surface()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let line = Line::from(Span::styled(
         format!(" {}", app.status),
-        Style::default().fg(SUB),
+        Style::default().fg(sub()),
     ));
     f.render_widget(Paragraph::new(line), inner);
 }
@@ -120,12 +120,12 @@ fn draw_status(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(accent()))
         .title(Line::from(vec![
-            Span::styled(" Pull requests ", Style::default().fg(ACCENT).bold()),
+            Span::styled(" Pull requests ", Style::default().fg(accent()).bold()),
             Span::styled(
                 format!("({}) ", app.pr_status.label()),
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             ),
             Span::styled(
                 format!(
@@ -144,7 +144,7 @@ fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                         .map(|n| format!("· ~{n} hits "))
                         .unwrap_or_default(),
                 ),
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             ),
             Span::styled(
                 format!(
@@ -158,10 +158,10 @@ fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                         ""
                     },
                 ),
-                Style::default().fg(GREEN),
+                Style::default().fg(green()),
             ),
         ]))
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(bg()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.pr_list_hit_rect.set(Some(inner));
@@ -180,25 +180,25 @@ fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             let line1 = Line::from(vec![
                 Span::styled(
                     format!("#{num} "),
-                    Style::default().fg(if sel { GREEN } else { SUB }),
+                    Style::default().fg(if sel { green() } else { sub() }),
                 ),
                 Span::styled(
                     format!("{badges} "),
-                    Style::default().fg(PEACH),
+                    Style::default().fg(peach()),
                 ),
                 Span::styled(
                     format!("@{author}  "),
-                    Style::default().fg(MAUVE),
+                    Style::default().fg(mauve()),
                 ),
-                Span::styled(meta, Style::default().fg(SUB)),
+                Span::styled(meta, Style::default().fg(sub())),
             ]);
             let title_disp = PrListEntry::ellipsize(title, inner.width.saturating_sub(4) as usize);
             let line2 = Line::from(vec![Span::styled(
                 format!("    {title_disp}"),
-                Style::default().fg(if sel { TEXT } else { SUB }),
+                Style::default().fg(if sel { theme_text() } else { sub() }),
             )]);
             let style = if sel {
-                Style::default().bg(SURFACE)
+                Style::default().bg(surface())
             } else {
                 Style::default()
             };
@@ -208,8 +208,8 @@ fn draw_pr_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(SURFACE)
-            .fg(TEXT)
+            .bg(surface())
+            .fg(theme_text())
             .add_modifier(Modifier::BOLD),
     );
     f.render_widget(list, inner);
@@ -237,15 +237,15 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             let active = *t == app.pr_tab;
             Line::from(Span::styled(
                 t.label(),
-                Style::default().fg(if active { GREEN } else { SUB }).bold(),
+                Style::default().fg(if active { green() } else { sub() }).bold(),
             ))
         })
         .collect();
 
         let tab_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(MAUVE))
-            .title(Line::from(Span::styled(" tabs ", Style::default().fg(MAUVE))));
+            .border_style(Style::default().fg(mauve()))
+            .title(Line::from(Span::styled(" tabs ", Style::default().fg(mauve()))));
         let tab_inner = tab_block.inner(h_chunks[0]);
         f.render_widget(tab_block, h_chunks[0]);
         f.render_widget(Paragraph::new(tabs), tab_inner);
@@ -258,9 +258,9 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         let head = Line::from(vec![
             Span::styled(
                 format!("#{} ", pr.number),
-                Style::default().fg(ACCENT).bold(),
+                Style::default().fg(accent()).bold(),
             ),
-            Span::styled(title, Style::default().fg(TEXT).bold()),
+            Span::styled(title, Style::default().fg(theme_text()).bold()),
         ]);
         let meta = format!(
             "{} → {}  (+{} −{} files {})",
@@ -291,12 +291,12 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         if !hide_header {
             let hb = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT));
+                .border_style(Style::default().fg(accent()));
             let hi = hb.inner(v[0]);
             f.render_widget(hb, v[0]);
             f.render_widget(Paragraph::new(head), hi);
             f.render_widget(
-                Paragraph::new(Span::styled(meta, Style::default().fg(SUB)))
+                Paragraph::new(Span::styled(meta, Style::default().fg(sub())))
                     .wrap(Wrap { trim: true }),
                 Rect {
                     x: hi.x,
@@ -321,7 +321,7 @@ fn draw_pr_detail(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Paragraph::new("No PR loaded").block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RED)),
+                    .border_style(Style::default().fg(red())),
             ),
             main,
         );
@@ -336,10 +336,10 @@ fn draw_tab_info(f: &mut Frame<'_>, app: &mut App, pr: &octocrab::models::pulls:
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(accent()))
                 .title(Line::from(Span::styled(
                     " description (Ctrl-d/u scroll) ",
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(accent()),
                 ))),
         );
     f.render_widget(p, area);
@@ -380,8 +380,8 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .map(|it| {
             let prefix = match it {
-                ThreadItem::Issue { .. } => ("conv", GREEN),
-                ThreadItem::Review { .. } => ("file", PEACH),
+                ThreadItem::Issue { .. } => ("conv", green()),
+                ThreadItem::Review { .. } => ("file", peach()),
             };
             let ind = match it {
                 ThreadItem::Review { id, .. } => reply_depth(*id),
@@ -409,10 +409,10 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ),
                 Span::styled(
                     format!("{}  ", it.author()),
-                    Style::default().fg(MAUVE),
+                    Style::default().fg(mauve()),
                 ),
-                Span::styled(path_hint, Style::default().fg(SUB)),
-                Span::styled(one_line, Style::default().fg(SUB)),
+                Span::styled(path_hint, Style::default().fg(sub())),
+                Span::styled(one_line, Style::default().fg(sub())),
             ]);
             ListItem::new(line)
         })
@@ -422,16 +422,16 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(GREEN))
+                .border_style(Style::default().fg(green()))
                 .title(Line::from(Span::styled(
                     " thread  j/k  L reactions  [ ] hunk scroll  E $EDITOR ",
-                    Style::default().fg(GREEN),
+                    Style::default().fg(green()),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(SURFACE)
-                .fg(TEXT)
+                .bg(surface())
+                .fg(theme_text())
                 .add_modifier(Modifier::BOLD),
         );
     if app.thread_items.is_empty() {
@@ -467,16 +467,16 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .unwrap_or((String::from("—"), String::from("Select a comment")));
 
     let hunk_widget = Paragraph::new(hunk_text.as_str())
-        .style(Style::default().fg(SUB))
+        .style(Style::default().fg(sub()))
         .wrap(Wrap { trim: false })
         .scroll((scroll_u16(app.thread_hunk_scroll), 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(PEACH))
+                .border_style(Style::default().fg(peach()))
                 .title(Line::from(Span::styled(
                     format!(" {hunk_title} "),
-                    Style::default().fg(PEACH),
+                    Style::default().fg(peach()),
                 ))),
         );
     f.render_widget(hunk_widget, hunk_area);
@@ -492,11 +492,11 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         body.lines.push(Line::default());
         body.lines.push(Line::from(vec![Span::styled(
             "— reactions —",
-            Style::default().fg(MAUVE).bold(),
+            Style::default().fg(mauve()).bold(),
         )]));
         body.lines.push(Line::from(vec![Span::styled(
             r.as_str(),
-            Style::default().fg(GREEN),
+            Style::default().fg(green()),
         )]));
     }
 
@@ -506,10 +506,10 @@ fn draw_tab_thread(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(MAUVE))
+                .border_style(Style::default().fg(mauve()))
                 .title(Line::from(Span::styled(
                     " comment (markdown)  Ctrl-d/u ",
-                    Style::default().fg(MAUVE),
+                    Style::default().fg(mauve()),
                 ))),
         );
     f.render_widget(p, body_area);
@@ -575,12 +575,12 @@ fn draw_tab_commits(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                         "{}  ",
                         c.sha.chars().take(7).collect::<String>()
                     ),
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(accent()),
                 ),
-                Span::styled(msg, Style::default().fg(if sel { TEXT } else { SUB })),
+                Span::styled(msg, Style::default().fg(if sel { theme_text() } else { sub() })),
             ]);
             ListItem::new(line).style(if sel {
-                Style::default().bg(SURFACE)
+                Style::default().bg(surface())
             } else {
                 Style::default()
             })
@@ -590,7 +590,7 @@ fn draw_tab_commits(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(accent()))
                 .title(" commits "),
         ),
         area,
@@ -606,10 +606,10 @@ fn draw_tab_files(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             let sel = i == app.file_cursor;
             ListItem::new(Span::styled(
                 s.as_str(),
-                Style::default().fg(if sel { TEXT } else { SUB }),
+                Style::default().fg(if sel { theme_text() } else { sub() }),
             ))
             .style(if sel {
-                Style::default().bg(SURFACE)
+                Style::default().bg(surface())
             } else {
                 Style::default()
             })
@@ -619,7 +619,7 @@ fn draw_tab_files(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(PEACH))
+                .border_style(Style::default().fg(peach()))
                 .title(" files "),
         ),
         area,
@@ -633,7 +633,7 @@ fn draw_tab_diff(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(RED))
+                .border_style(Style::default().fg(red()))
                 .title(" diff — Ctrl-d/u scroll · E opens in $VISUAL/$EDITOR (loads if empty) "),
         );
     f.render_widget(p, area);
@@ -654,7 +654,7 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|r| {
             ListItem::new(Span::styled(
                 r.summary.as_str(),
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             ))
         })
         .collect();
@@ -662,16 +662,16 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(MAUVE))
+                .border_style(Style::default().fg(mauve()))
                 .title(Line::from(Span::styled(
                     " reviews  j/k · Enter full text · a composer ",
-                    Style::default().fg(MAUVE),
+                    Style::default().fg(mauve()),
                 ))),
         )
         .highlight_style(
             Style::default()
-                .bg(SURFACE)
-                .fg(TEXT)
+                .bg(surface())
+                .fg(theme_text())
                 .add_modifier(Modifier::BOLD),
         );
     if app.reviews_cached.is_empty() {
@@ -684,15 +684,15 @@ fn draw_tab_reviews(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
     f.render_stateful_widget(list, chunks[0], &mut app.review_list_state);
     let hint = Paragraph::new(Line::from(vec![
-        Span::styled(" a ", Style::default().fg(GREEN).bold()),
+        Span::styled(" a ", Style::default().fg(green()).bold()),
         Span::styled(
             "composer · Enter on row = read whole review · z/Z widen layout (see ? on tab)  ",
-            Style::default().fg(SUB),
+            Style::default().fg(sub()),
         ),
-        Span::styled("Esc", Style::default().fg(ACCENT)),
-        Span::styled(" closes composer.", Style::default().fg(SUB)),
+        Span::styled("Esc", Style::default().fg(accent())),
+        Span::styled(" closes composer.", Style::default().fg(sub())),
     ]))
-    .style(Style::default().bg(BG));
+    .style(Style::default().bg(bg()));
     f.render_widget(hint, chunks[1]);
 }
 
@@ -752,12 +752,12 @@ fn review_diff_list_item(dl: &DiffDisplayLine, body_budget: usize, selected: boo
             let t = PrListEntry::ellipsize(dl.body.as_str(), body_budget.max(8));
             ListItem::new(Line::from(Span::styled(
                 t,
-                Style::default().fg(MAUVE).italic(),
+                Style::default().fg(mauve()).italic(),
             )))
         }
         DiffLineKind::OutsideHunk => {
             let t = PrListEntry::ellipsize(dl.body.as_str(), body_budget.max(8));
-            ListItem::new(Line::from(Span::styled(t, Style::default().fg(SUB))))
+            ListItem::new(Line::from(Span::styled(t, Style::default().fg(sub()))))
         }
         _ => {
             let old_s = dl
@@ -770,14 +770,14 @@ fn review_diff_list_item(dl: &DiffDisplayLine, body_budget: usize, selected: boo
                 .unwrap_or_else(|| "    ".to_string());
             let marker = dl.marker_char();
             let mk_fg = match dl.kind {
-                DiffLineKind::Removed => RED,
-                DiffLineKind::Added => GREEN,
-                _ => SUB,
+                DiffLineKind::Removed => red(),
+                DiffLineKind::Added => green(),
+                _ => sub(),
             };
             let (body_fg, body_bg) = match dl.kind {
-                DiffLineKind::Removed => (Color::Rgb(242, 200, 205), DIFF_DEL_BG),
-                DiffLineKind::Added => (Color::Rgb(190, 230, 200), DIFF_ADD_BG),
-                _ => (TEXT, BG),
+                DiffLineKind::Removed => (theme::current().diff_del_text, diff_del_bg()),
+                DiffLineKind::Added => (theme::current().diff_add_text, diff_add_bg()),
+                _ => (theme_text(), bg()),
             };
             let body = PrListEntry::ellipsize(dl.body.as_str(), body_budget.max(8));
             let pin = if dl.anchor.is_some() {
@@ -785,21 +785,21 @@ fn review_diff_list_item(dl: &DiffDisplayLine, body_budget: usize, selected: boo
                     Span::styled(
                         "+",
                         Style::default()
-                            .fg(BG)
-                            .bg(ACCENT)
+                            .fg(bg())
+                            .bg(accent())
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Span::styled("·", Style::default().fg(ACCENT))
+                    Span::styled("·", Style::default().fg(accent()))
                 }
             } else {
                 Span::raw(" ")
             };
             ListItem::new(Line::from(vec![
-                Span::styled(old_s, Style::default().fg(SUB)),
-                Span::styled("│", Style::default().fg(SURFACE)),
-                Span::styled(new_s, Style::default().fg(SUB)),
-                Span::styled("│", Style::default().fg(SURFACE)),
+                Span::styled(old_s, Style::default().fg(sub())),
+                Span::styled("│", Style::default().fg(surface())),
+                Span::styled(new_s, Style::default().fg(sub())),
+                Span::styled("│", Style::default().fg(surface())),
                 Span::styled(
                     format!("{marker} "),
                     Style::default().fg(mk_fg),
@@ -819,18 +819,18 @@ fn draw_inline_comment_draft(f: &mut Frame<'_>, area: Rect, draft: &InlineCommen
     let path_short = PrListEntry::ellipsize(draft.path.as_str(), 24);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(accent()))
         .title(Line::from(vec![
-            Span::styled(" Write ", Style::default().fg(ACCENT).bold()),
+            Span::styled(" Write ", Style::default().fg(accent()).bold()),
             Span::styled(
                 format!("{path_short}  L{} {}  ", draft.line, draft.side),
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             ),
-            Span::styled("Ctrl+Enter", Style::default().fg(GREEN)),
-            Span::styled(" · ", Style::default().fg(SUB)),
-            Span::styled("Esc", Style::default().fg(PEACH)),
-            Span::styled(" · ", Style::default().fg(SUB)),
-            Span::styled("Ctrl+e", Style::default().fg(MAUVE)),
+            Span::styled("Ctrl+Enter", Style::default().fg(green())),
+            Span::styled(" · ", Style::default().fg(sub())),
+            Span::styled("Esc", Style::default().fg(peach())),
+            Span::styled(" · ", Style::default().fg(sub())),
+            Span::styled("Ctrl+e", Style::default().fg(mauve())),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -839,9 +839,9 @@ fn draw_inline_comment_draft(f: &mut Frame<'_>, area: Rect, draft: &InlineCommen
         let line = Line::from(vec![
             Span::styled(
                 "Leave a comment (Markdown). Use ```suggestion``` for proposed edits (same as github.com). ",
-                Style::default().fg(SUB).italic(),
+                Style::default().fg(sub()).italic(),
             ),
-            Span::styled("▍", Style::default().fg(ACCENT).bold()),
+            Span::styled("▍", Style::default().fg(accent()).bold()),
         ]);
         f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), inner);
         return;
@@ -859,15 +859,15 @@ fn draw_inline_comment_draft(f: &mut Frame<'_>, area: Rect, draft: &InlineCommen
         if ri == cur_row {
             let (a, b) = split_unicode_str_at(li, cur_col);
             text_lines.push(Line::from(vec![
-                Span::styled(a, Style::default().fg(TEXT)),
-                Span::styled("▍", Style::default().fg(ACCENT).bold()),
-                Span::styled(b, Style::default().fg(TEXT)),
+                Span::styled(a, Style::default().fg(theme_text())),
+                Span::styled("▍", Style::default().fg(accent()).bold()),
+                Span::styled(b, Style::default().fg(theme_text())),
             ]));
         } else {
             let ell = PrListEntry::ellipsize(li.as_str(), w.max(8));
             text_lines.push(Line::from(Span::styled(
                 ell,
-                Style::default().fg(TEXT),
+                Style::default().fg(theme_text()),
             )));
         }
     }
@@ -890,16 +890,16 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let foot_h = 1u16;
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(GREEN))
+        .border_style(Style::default().fg(green()))
         .title(Line::from(vec![
-            Span::styled(" review composer ", Style::default().fg(GREEN).bold()),
+            Span::styled(" review composer ", Style::default().fg(green()).bold()),
             Span::styled(
                 format!("pending #{}  ", comp.pending_review_id),
-                Style::default().fg(MAUVE),
+                Style::default().fg(mauve()),
             ),
             Span::styled(
                 format!("{}  ", &comp.commit_sha[..comp.commit_sha.len().min(7)]),
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             ),
         ]));
     let inner = outer.inner(area);
@@ -921,18 +921,18 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Line::from(
                 Span::styled(
                     "Discard pending review on GitHub?",
-                    Style::default().fg(RED).bold(),
+                    Style::default().fg(red()).bold(),
                 ),
             ),
             Line::from(""),
             Line::from(Span::styled(
                 "Draft inline comments in this review will be removed.",
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "y  yes     n / Esc  cancel",
-                Style::default().fg(TEXT),
+                Style::default().fg(theme_text()),
             )),
         ]);
         f.render_widget(
@@ -942,7 +942,7 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 " confirm discard ",
-                Style::default().fg(RED),
+                Style::default().fg(red()),
             )),
             v[2],
         );
@@ -961,16 +961,16 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         ])
         .split(v[1]);
 
-    let b_files = pane_border(comp.focus == ReviewsComposePane::Files, ACCENT);
+    let b_files = pane_border(comp.focus == ReviewsComposePane::Files, accent());
     let files_block = Block::default()
         .borders(Borders::ALL)
         .border_style(b_files)
         .title(Line::from(Span::styled(
             " ① files ",
             Style::default().fg(if comp.focus == ReviewsComposePane::Files {
-                GREEN
+                green()
             } else {
-                SUB
+                sub()
             }),
         )));
     let fi = files_block.inner(body[0]);
@@ -981,7 +981,7 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|p| {
             ListItem::new(Span::styled(
                 p.as_str(),
-                Style::default().fg(SUB),
+                Style::default().fg(sub()),
             ))
         })
         .collect();
@@ -989,8 +989,8 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(files_block)
         .highlight_style(
             Style::default()
-                .bg(SURFACE)
-                .fg(TEXT)
+                .bg(surface())
+                .fg(theme_text())
                 .add_modifier(Modifier::BOLD),
         );
     if app.file_paths.is_empty() {
@@ -1003,7 +1003,7 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
     f.render_stateful_widget(flist, body[0], &mut app.inline_review_file_state);
 
-    let b_diff = pane_border(comp.focus == ReviewsComposePane::Diff, PEACH);
+    let b_diff = pane_border(comp.focus == ReviewsComposePane::Diff, peach());
     let mid_col = body[1];
     let split_mid = if comp.comment_draft.is_some() {
         Layout::default()
@@ -1036,9 +1036,9 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .title(Line::from(Span::styled(
             diff_title,
             Style::default().fg(if comp.focus == ReviewsComposePane::Diff {
-                PEACH
+                peach()
             } else {
-                SUB
+                sub()
             }),
         )));
     let di = diff_block.inner(code_area);
@@ -1057,11 +1057,11 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect();
     let hl = if comp.comment_draft.is_some() {
-        Style::default().bg(SURFACE).fg(SUB)
+        Style::default().bg(surface()).fg(sub())
     } else {
         Style::default()
-            .bg(SURFACE)
-            .fg(GREEN)
+            .bg(surface())
+            .fg(green())
             .add_modifier(Modifier::BOLD)
     };
     let dlist = List::new(diff_items).block(diff_block).highlight_style(hl);
@@ -1084,20 +1084,20 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(body[2]);
 
-    let b_act = pane_border(comp.focus == ReviewsComposePane::Actions, MAUVE);
+    let b_act = pane_border(comp.focus == ReviewsComposePane::Actions, mauve());
     let sess_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(SUB))
+        .border_style(Style::default().fg(sub()))
         .title(Line::from(Span::styled(
             format!(" session ({}) ", comp.session_comments.len()),
-            Style::default().fg(SUB),
+            Style::default().fg(sub()),
         )));
     let si = sess_block.inner(act_body[0]);
     f.render_widget(sess_block, act_body[0]);
     let sess_txt = if comp.session_comments.is_empty() {
         Text::from(Line::from(Span::styled(
             "No comments in this session yet — in ② press Enter on a + line to write.",
-            Style::default().fg(SUB).italic(),
+            Style::default().fg(sub()).italic(),
         )))
     } else {
         Text::from(
@@ -1106,7 +1106,7 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .map(|s| {
                     Line::from(Span::styled(
                         PrListEntry::ellipsize(s, si.width.saturating_sub(2) as usize),
-                        Style::default().fg(TEXT),
+                        Style::default().fg(theme_text()),
                     ))
                 })
                 .collect::<Vec<_>>(),
@@ -1123,9 +1123,9 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .title(Line::from(Span::styled(
             " ③ finish ",
             Style::default().fg(if comp.focus == ReviewsComposePane::Actions {
-                MAUVE
+                mauve()
             } else {
-                SUB
+                sub()
             }),
         )));
     let fai = finish_block.inner(act_body[1]);
@@ -1138,14 +1138,14 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     ];
     let items: Vec<ListItem> = labels
         .iter()
-        .map(|l| ListItem::new(Span::styled(*l, Style::default().fg(TEXT))))
+        .map(|l| ListItem::new(Span::styled(*l, Style::default().fg(theme_text()))))
         .collect();
     let alist = List::new(items)
         .block(finish_block)
         .highlight_style(
             Style::default()
-                .bg(SURFACE)
-                .fg(MAUVE)
+                .bg(surface())
+                .fg(mauve())
                 .add_modifier(Modifier::BOLD),
         );
     let si_sel = comp.submit_cursor.min(3);
@@ -1168,7 +1168,7 @@ fn draw_reviews_composer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
     };
     f.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(SUB))),
+        Paragraph::new(Span::styled(footer, Style::default().fg(sub()))),
         v[2],
     );
 
@@ -1179,7 +1179,7 @@ fn pane_border(focused: bool, accent: Color) -> Style {
     if focused {
         Style::default().fg(accent).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(SURFACE)
+        Style::default().fg(surface())
     }
 }
 
@@ -1189,7 +1189,7 @@ fn pane_strip_line(focus: ReviewsComposePane) -> Line<'static> {
         Span::styled(
             label,
             Style::default()
-                .fg(if on { GREEN } else { SUB })
+                .fg(if on { green() } else { sub() })
                 .add_modifier(if on {
                     Modifier::BOLD
                 } else {
@@ -1199,13 +1199,13 @@ fn pane_strip_line(focus: ReviewsComposePane) -> Line<'static> {
     };
     Line::from(vec![
         mk(ReviewsComposePane::Files, " Files "),
-        Span::styled(" │ ", Style::default().fg(SUB)),
+        Span::styled(" │ ", Style::default().fg(sub())),
         mk(ReviewsComposePane::Diff, " Diff "),
-        Span::styled(" │ ", Style::default().fg(SUB)),
+        Span::styled(" │ ", Style::default().fg(sub())),
         mk(ReviewsComposePane::Actions, " Finish "),
         Span::styled(
             "     Tab · Shift+Tab · Esc close ",
-            Style::default().fg(SUB),
+            Style::default().fg(sub()),
         ),
     ])
 }
@@ -1230,7 +1230,8 @@ PR LIST\n\
   j k Enter     move / open PR       Mouse   pick row\n\
   f A           filters / status      a       cycle list status\n\
   m r n         more / refresh / new PR wizard    o  browser\n\
-  : cmd         :help :filter :create …    q quit\n",
+  t             cycle color theme\n\
+  : cmd         :help :filter :theme …     q quit\n",
         HelpContext::PrDetailInfo => "\
 INFO TAB\n\
   q             back to list          1-6     other tabs\n\
@@ -1264,7 +1265,7 @@ REVIEWS TAB (submitted)\n\
   z Z           layout\n\
 \n\
 GLOBAL IN PR\n\
-  q list  r reload  o PR in browser  : cmd  ? help\n",
+  q list  r reload  o PR in browser  t theme  : cmd  ? help\n",
         HelpContext::PrDetailReviewsComposer => "\
 REVIEW COMPOSER (pending review on GitHub)\n\
   Tab Shift+Tab   Files → Diff → Finish     Esc  exit composer\n\
@@ -1298,13 +1299,13 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT))
+                        .border_style(Style::default().fg(accent()))
                         .title(Line::from(vec![
-                            Span::styled(" help ", Style::default().fg(ACCENT).bold()),
-                            Span::styled(title, Style::default().fg(SUB)),
-                            Span::styled("  q Esc ? close ", Style::default().fg(SUB)),
+                            Span::styled(" help ", Style::default().fg(accent()).bold()),
+                            Span::styled(title, Style::default().fg(sub())),
+                            Span::styled("  q Esc ? close ", Style::default().fg(sub())),
                         ]))
-                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                        .style(Style::default().bg(surface()).fg(theme_text())),
                 );
             f.render_widget(p, area);
         }
@@ -1326,21 +1327,21 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(MAUVE))
+                        .border_style(Style::default().fg(mauve()))
                         .title(Line::from(vec![
                             Span::styled(
                                 format!(" {title} "),
-                                Style::default().fg(MAUVE).bold(),
+                                Style::default().fg(mauve()).bold(),
                             ),
                             Span::styled(
                                 format!(
                                     "  {}  ·  j/k · Ctrl+d/u · o · q ",
                                     PrListEntry::ellipsize(url.as_str(), 36)
                                 ),
-                                Style::default().fg(SUB),
+                                Style::default().fg(sub()),
                             ),
                         ]))
-                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                        .style(Style::default().bg(surface()).fg(theme_text())),
                 );
             f.render_widget(p, area);
         }
@@ -1356,12 +1357,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(GREEN))
+                        .border_style(Style::default().fg(green()))
                         .title(Line::from(Span::styled(
                             " filters (f)  s → status  Esc/q/click close ",
-                            Style::default().fg(GREEN).bold(),
+                            Style::default().fg(green()).bold(),
                         )))
-                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                        .style(Style::default().bg(surface()).fg(theme_text())),
                 );
             f.render_widget(p, area);
         }
@@ -1381,10 +1382,10 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                     let sel = i == cur;
                     ListItem::new(Span::styled(
                         *label,
-                        Style::default().fg(if sel { GREEN } else { TEXT }),
+                        Style::default().fg(if sel { green() } else { theme_text() }),
                     ))
                     .style(if sel {
-                        Style::default().bg(BG)
+                        Style::default().bg(bg())
                     } else {
                         Style::default()
                     })
@@ -1394,9 +1395,9 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 List::new(items).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT))
+                        .border_style(Style::default().fg(accent()))
                         .title(" status  j/k Enter apply  Esc → back  q close ")
-                        .style(Style::default().bg(SURFACE)),
+                        .style(Style::default().bg(surface())),
                 ),
                 area,
             );
@@ -1415,9 +1416,9 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(MAUVE))
+                        .border_style(Style::default().fg(mauve()))
                         .title(" command ")
-                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                        .style(Style::default().bg(surface()).fg(theme_text())),
                 );
             f.render_widget(p, area);
         }
@@ -1446,10 +1447,10 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                     let sel = i == app.reaction_cursor;
                     ListItem::new(Span::styled(
                         *label,
-                        Style::default().fg(if sel { GREEN } else { TEXT }),
+                        Style::default().fg(if sel { green() } else { theme_text() }),
                     ))
                     .style(if sel {
-                        Style::default().bg(BG)
+                        Style::default().bg(bg())
                     } else {
                         Style::default()
                     })
@@ -1459,9 +1460,9 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 List::new(items).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(PEACH))
+                        .border_style(Style::default().fg(peach()))
                         .title(" reaction (+) j/k Enter ")
-                        .style(Style::default().bg(SURFACE)),
+                        .style(Style::default().bg(surface())),
                 ),
                 area,
             );
@@ -1490,9 +1491,9 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
             let p = Paragraph::new(text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(GREEN))
+                    .border_style(Style::default().fg(green()))
                     .title(" new PR — head/base prefilled from git when possible ")
-                    .style(Style::default().bg(SURFACE).fg(TEXT)),
+                    .style(Style::default().bg(surface()).fg(theme_text())),
             );
             f.render_widget(p, area);
         }
@@ -1507,12 +1508,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "Delete this comment?",
-                    Style::default().fg(RED).bold(),
+                    Style::default().fg(red()).bold(),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "y  yes     n / Esc  cancel",
-                    Style::default().fg(TEXT),
+                    Style::default().fg(theme_text()),
                 )),
             ]);
             let p = Paragraph::new(text)
@@ -1520,9 +1521,9 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(RED))
+                        .border_style(Style::default().fg(red()))
                         .title(" confirm delete ")
-                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                        .style(Style::default().bg(surface()).fg(theme_text())),
                 );
             f.render_widget(p, area);
         }
@@ -1542,12 +1543,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 Line::from(""),
                 Line::from(Span::styled(
                     format!("Merge this PR ({label})?"),
-                    Style::default().fg(PEACH).bold(),
+                    Style::default().fg(peach()).bold(),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "y  yes     n / Esc  cancel",
-                    Style::default().fg(TEXT),
+                    Style::default().fg(theme_text()),
                 )),
             ]);
             let p = Paragraph::new(text)
@@ -1555,12 +1556,11 @@ fn draw_overlay(f: &mut Frame<'_>, app: &mut App, full: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(PEACH))
+                        .border_style(Style::default().fg(peach()))
                         .title(" confirm merge ")
-                        .style(Style::default().bg(SURFACE).fg(TEXT)),
+                        .style(Style::default().bg(surface()).fg(theme_text())),
                 );
             f.render_widget(p, area);
         }
     }
 }
-

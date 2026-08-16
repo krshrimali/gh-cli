@@ -3,6 +3,7 @@ use crate::diff_pick;
 use crate::editor;
 use crate::git;
 use crate::markdown_render;
+use crate::theme::Theme;
 use crate::ui;
 use crate::github;
 use std::collections::HashMap;
@@ -541,6 +542,7 @@ pub struct App {
     pub vim_g_pending: bool,
     pub reaction_cursor: usize,
     pub loading: bool,
+    pub theme: Theme,
     /// Inner rect of the PR list widget (for mouse hit-testing). Reset each frame.
     pub pr_list_hit_rect: Cell<Option<Rect>>,
 }
@@ -553,6 +555,7 @@ impl App {
         octo: Octocrab,
         me: Option<String>,
         status_cli: Option<github::PrStatusFilter>,
+        theme_cli: Option<Theme>,
     ) -> Self {
         let mut s = Self {
             owner,
@@ -610,12 +613,22 @@ impl App {
             vim_g_pending: false,
             reaction_cursor: 0,
             loading: false,
+            theme: Theme::Dark,
             pr_list_hit_rect: Cell::new(None),
         };
         s.apply_env_default_filters();
         if let Some(st) = status_cli {
             s.pr_status = st;
         }
+        if let Ok(value) = std::env::var("GH_PR_CLI_THEME") {
+            if let Some(theme) = Theme::parse(&value) {
+                s.theme = theme;
+            }
+        }
+        if let Some(theme) = theme_cli {
+            s.theme = theme;
+        }
+        s.theme.activate();
         s
     }
 
@@ -1405,6 +1418,17 @@ impl App {
             return self.handle_overlay_key(key, rt);
         }
 
+        let editing_inline_comment = self
+            .reviews_composer
+            .as_ref()
+            .is_some_and(|composer| composer.comment_draft.is_some());
+        if key.code == KeyCode::Char('t') && key.modifiers.is_empty() && !editing_inline_comment {
+            self.theme = self.theme.next();
+            self.theme.activate();
+            self.set_status(format!("theme: {}", self.theme.label()));
+            return Ok(AppEffect::None);
+        }
+
         match self.screen {
             Screen::PrList => self.handle_pr_list(key, rt),
             Screen::PrDetail => self.handle_pr_detail(key, rt),
@@ -1695,6 +1719,21 @@ impl App {
         }
         match parts[0] {
             "q" | "quit" | "exit" => return Ok(Some(AppEffect::Quit)),
+            "theme" if parts.len() == 1 => {
+                self.set_status(format!(
+                    "theme: {} (dark, light, high-contrast, terminal)",
+                    self.theme.label()
+                ));
+            }
+            "theme" if parts.len() == 2 => {
+                if let Some(theme) = Theme::parse(parts[1]) {
+                    self.theme = theme;
+                    self.theme.activate();
+                    self.set_status(format!("theme: {}", theme.label()));
+                } else {
+                    self.set_status("usage: theme dark|light|high-contrast|terminal");
+                }
+            }
             "repo" if parts.len() == 2 => {
                 if let Some((o, r)) = parts[1].split_once('/') {
                     self.owner = o.to_string();
