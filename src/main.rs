@@ -1,10 +1,11 @@
 mod app;
-mod diff_pick;
 mod diff_nvim;
+mod diff_pick;
 mod editor;
 mod git;
 mod github;
 mod markdown_render;
+mod theme;
 mod ui;
 
 use anyhow::Context;
@@ -22,6 +23,9 @@ struct Cli {
     /// PR list status filter: open | closed | merged | draft | all (overrides `GH_PR_CLI_STATUS`).
     #[arg(long, value_name = "STATE")]
     status: Option<String>,
+    /// Color theme: dark | light | high-contrast | terminal (overrides `GH_PR_CLI_THEME`).
+    #[arg(long, value_name = "THEME")]
+    theme: Option<String>,
 }
 
 fn parse_github_remote(raw: &str) -> Option<(String, String)> {
@@ -76,14 +80,23 @@ fn main() -> anyhow::Result<()> {
     let status_cli = if let Some(s) = cli.status.as_deref() {
         let t = s.trim();
         Some(github::parse_pr_status_filter(t).ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid --status {t:?}: use open, closed, merged, draft, or all"
-            )
+            anyhow::anyhow!("invalid --status {t:?}: use open, closed, merged, draft, or all")
         })?)
     } else {
         None
     };
-    let mut app = App::new(owner, repo, octo, None, status_cli);
+    let theme_cli = cli
+        .theme
+        .as_deref()
+        .map(|value| {
+            theme::Theme::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --theme {value:?}: use dark, light, high-contrast, or terminal"
+                )
+            })
+        })
+        .transpose()?;
+    let mut app = App::new(owner, repo, octo, None, status_cli, theme_cli);
     let mut terminal = ratatui::try_init().context("terminal init")?;
     let result = app.run(&mut terminal, &rt);
     ratatui::restore();

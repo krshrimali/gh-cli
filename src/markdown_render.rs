@@ -3,14 +3,15 @@
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
+use crate::theme;
 
-const TEXT: Color = Color::Rgb(205, 214, 244);
-const SUB: Color = Color::Rgb(166, 173, 200);
-const ACCENT: Color = Color::Rgb(137, 180, 250);
-const GREEN: Color = Color::Rgb(166, 227, 161);
-const PEACH: Color = Color::Rgb(250, 179, 135);
-const MAUVE: Color = Color::Rgb(203, 166, 247);
-const CODE_BG: Color = Color::Rgb(40, 42, 58);
+fn theme_text() -> Color { theme::current().text }
+fn sub() -> Color { theme::current().sub }
+fn accent() -> Color { theme::current().accent }
+fn green() -> Color { theme::current().green }
+fn peach() -> Color { theme::current().peach }
+fn mauve() -> Color { theme::current().mauve }
+fn code_bg() -> Color { theme::current().code_bg }
 
 /// First image URL in markdown (`![](url)`).
 pub fn first_image_url(markdown: &str) -> Option<String> {
@@ -31,7 +32,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
     let opts = Options::all();
     let parser = Parser::new_ext(md, opts);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let code_style = Style::default().fg(SUB).bg(CODE_BG);
+    let code_style = Style::default().fg(sub()).bg(code_bg());
     let mut in_code = false;
     let mut code_buf = String::new();
     let mut in_table = false;
@@ -45,7 +46,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
         for wline in textwrap::wrap(&t, wrap_width) {
             lines.push(Line::from(vec![Span::styled(
                 wline.to_string(),
-                Style::default().fg(TEXT),
+                Style::default().fg(theme_text()),
             )]));
         }
         lines.push(Line::default());
@@ -63,7 +64,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 };
                 lines.push(Line::from(vec![Span::styled(
                     label,
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(accent()),
                 )]));
             }
             Event::End(TagEnd::CodeBlock) => {
@@ -75,7 +76,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 }
                 lines.push(Line::from(vec![Span::styled(
                     "└────────",
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(accent()),
                 )]));
                 lines.push(Line::default());
                 in_code = false;
@@ -86,14 +87,14 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 in_table = true;
                 lines.push(Line::from(vec![Span::styled(
                     "┌─ table ───────────────────",
-                    Style::default().fg(PEACH).italic(),
+                    Style::default().fg(peach()).italic(),
                 )]));
             }
             Event::End(TagEnd::Table) => {
                 in_table = false;
                 lines.push(Line::from(vec![Span::styled(
                     "└───────────────────────────",
-                    Style::default().fg(PEACH).italic(),
+                    Style::default().fg(peach()).italic(),
                 )]));
                 lines.push(Line::default());
             }
@@ -107,10 +108,10 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
             Event::Start(Tag::Link { dest_url, .. }) => {
                 flush_para(&mut para, &mut lines);
                 lines.push(Line::from(vec![
-                    Span::styled("→ ", Style::default().fg(GREEN)),
+                    Span::styled("→ ", Style::default().fg(green())),
                     Span::styled(
                         dest_url.to_string(),
-                        Style::default().fg(ACCENT).underlined(),
+                        Style::default().fg(accent()).underlined(),
                     ),
                 ]));
             }
@@ -122,21 +123,21 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 let tit = title.to_string();
                 lines.push(Line::from(vec![Span::styled(
                     "🖼  image",
-                    Style::default().fg(PEACH).bold(),
+                    Style::default().fg(peach()).bold(),
                 )]));
                 if !tit.is_empty() {
                     lines.push(Line::from(vec![Span::styled(
                         format!("   {tit}"),
-                        Style::default().fg(SUB),
+                        Style::default().fg(sub()),
                     )]));
                 }
                 lines.push(Line::from(vec![Span::styled(
                     format!("   {}", dest_url),
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(accent()),
                 )]));
                 lines.push(Line::from(vec![Span::styled(
                     "   Kitty: press I — `kitten icat` URL",
-                    Style::default().fg(SUB).italic(),
+                    Style::default().fg(sub()).italic(),
                 )]));
                 lines.push(Line::default());
             }
@@ -171,7 +172,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 flush_para(&mut para, &mut lines);
                 lines.push(Line::from(vec![Span::styled(
                     "────────────────────────",
-                    Style::default().fg(SUB),
+                    Style::default().fg(sub()),
                 )]));
                 lines.push(Line::default());
             }
@@ -181,7 +182,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 for wline in textwrap::wrap(&s, wrap_width) {
                     lines.push(Line::from(vec![Span::styled(
                         wline.to_string(),
-                        Style::default().fg(SUB),
+                        Style::default().fg(sub()),
                     )]));
                 }
                 lines.push(Line::default());
@@ -199,7 +200,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 let n = heading_level_usize(level);
                 lines.push(Line::from(vec![Span::styled(
                     format!("{} ", "█".repeat(n)),
-                    Style::default().fg(MAUVE).bold(),
+                    Style::default().fg(mauve()).bold(),
                 )]));
             }
             Event::End(TagEnd::Heading(level)) => {
@@ -210,7 +211,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 flush_para(&mut para, &mut lines);
                 lines.push(Line::from(vec![Span::styled(
                     "│ ",
-                    Style::default().fg(MAUVE),
+                    Style::default().fg(mauve()),
                 )]));
             }
             Event::End(TagEnd::BlockQuote(_)) => {
@@ -229,7 +230,7 @@ pub fn markdown_to_text(md: &str, wrap_width: usize) -> Text<'static> {
                 flush_para(&mut para, &mut lines);
                 lines.push(Line::from(vec![Span::styled(
                     "  ─────────────────",
-                    Style::default().fg(SUB),
+                    Style::default().fg(sub()),
                 )]));
             }
             Event::Start(Tag::FootnoteDefinition(_)) | Event::End(TagEnd::FootnoteDefinition) => {}
